@@ -73,6 +73,8 @@ class Request:
         block_hasher: Callable[["Request"], list["BlockHash"]] | None = None,
         resumable: bool = False,
         reasoning_ended: bool | None = None,
+        is_dcpp: bool | None = False,
+        dcpp_scheduled_chunk: int | None = 0,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -155,6 +157,8 @@ class Request:
         # The number of NaNs in logits. A value greater than 0
         # indicates that the output is corrupted
         self.num_nans_in_logits = 0
+        self.is_dcpp = is_dcpp
+        self.dcpp_scheduled_chunk = dcpp_scheduled_chunk
 
         # The number of times this request has been preempted by the scheduler.
         self.num_preemptions = 0

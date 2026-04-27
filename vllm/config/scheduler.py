@@ -146,6 +146,18 @@ class SchedulerConfig:
     while a larger value (e.g., 10) reduces host overhead and may increase throughput
     by batching multiple tokens before sending."""
 
+    # --- DCPP (Dynamic Chunked Prefill Planning) ---
+    enable_dcpp: bool = False
+    """EXPERIMENTAL: Enable dynamic chunked prefill planning (DCPP)."""
+
+    dcpp_min_chunk: int | None = None
+    """Minimum prefill chunk size when DCPP is enabled. If None, a backend
+    specific default will be used."""
+
+    dcpp_length_threshold: int = 0
+    """Input length threshold to trigger DCPP logic. Requests with prompt
+    length below this value will not use DCPP even if enabled."""
+
     @staticmethod
     def default_factory(**kwargs):
         """
@@ -178,7 +190,6 @@ class SchedulerConfig:
         if not isinstance(self.scheduler_cls, str):
             return cast(type["SchedulerInterface"], self.scheduler_cls)
         return resolve_obj_by_qualname(self.scheduler_cls)
-
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
