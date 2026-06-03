@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
 from typing import Any
 
 import torch
@@ -104,15 +105,22 @@ class DefaultModelState(ModelState):
         input_batch: InputBatch,
         req_states: RequestState,
     ) -> torch.Tensor:
+        _t = time.perf_counter()
         mm_hashes, mm_kwargs = self.encoder_runner.prepare_mm_inputs(
             scheduled_encoder_inputs
         )
+        print(f"[vllm_prepare_input] mm.prepare_mm_inputs {(time.perf_counter() - _t) * 1000:.3f} ms items={len(mm_kwargs)}", flush=True)
         if mm_kwargs:
             # Execute the multimodal encoder.
+            _t = time.perf_counter()
             encoder_outputs = self.encoder_runner.execute_mm_encoder(mm_kwargs)
+            print(f"[vllm_prepare_input] mm.execute_mm_encoder {(time.perf_counter() - _t) * 1000:.3f} ms outputs={len(encoder_outputs)}", flush=True)
             # Cache the encoder outputs by mm_hash
+            _t = time.perf_counter()
             self.encoder_cache.encoder_outputs.update(zip(mm_hashes, encoder_outputs))
+            print(f"[vllm_prepare_input] mm.cache_encoder_outputs {(time.perf_counter() - _t) * 1000:.3f} ms", flush=True)
 
+        _t = time.perf_counter()
         mm_embeds, is_mm_embed = self.encoder_runner.gather_mm_embeddings(
             input_batch.req_ids,
             input_batch.num_tokens,
@@ -121,12 +129,15 @@ class DefaultModelState(ModelState):
             req_states.prefill_len.np[input_batch.idx_mapping_np],
             req_states.num_computed_prefill_tokens[input_batch.idx_mapping_np],
         )
+        print(f"[vllm_prepare_input] mm.gather_mm_embeddings {(time.perf_counter() - _t) * 1000:.3f} ms embeds={len(mm_embeds)}", flush=True)
         # Use unpadded input_ids to match is_mm_embed size (num_tokens).
         # input_batch.input_ids may be padded for CUDA graphs.
         input_ids_unpadded = input_batch.input_ids[: input_batch.num_tokens]
+        _t = time.perf_counter()
         inputs_embeds = self.encoder_runner.get_inputs_embeds(
             input_ids_unpadded, mm_embeds, is_mm_embed
         )
+        print(f"[vllm_prepare_input] mm.get_inputs_embeds {(time.perf_counter() - _t) * 1000:.3f} ms", flush=True)
         return inputs_embeds[: input_batch.num_tokens_after_padding]
 
     def prepare_inputs(
@@ -135,6 +146,7 @@ class DefaultModelState(ModelState):
         if self.rope_state is None:
             return {}  # Common case (1D positions).
 
+        _t = time.perf_counter()
         self.rope_state.prepare_positions(
             input_batch.idx_mapping,
             input_batch.query_start_loc,
@@ -142,6 +154,7 @@ class DefaultModelState(ModelState):
             req_states.num_computed_tokens.gpu,
         )
         positions = self.rope_state.get_positions(input_batch.num_tokens_after_padding)
+        print(f"[vllm_prepare_input] model_state.prepare_positions {(time.perf_counter() - _t) * 1000:.3f} ms", flush=True)
         return {"positions": positions}
 
     def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:

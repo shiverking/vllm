@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
+
 import numpy as np
 import torch
 
@@ -56,7 +58,9 @@ class EncoderRunner:
         for modality, num_items, mm_kwargs_batch in group_and_batch_mm_kwargs(
             mm_kwargs, device=self.device, pin_memory=False
         ):
+            _t = time.perf_counter()
             batch_outputs = self.model.embed_multimodal(**mm_kwargs_batch)
+            print(f"[vllm_prepare_input] mm.encoder_runner.embed_multimodal {(time.perf_counter() - _t) * 1000:.3f} ms modality={modality} items={num_items}", flush=True)
             sanity_check_mm_encoder_outputs(batch_outputs, expected_num_items=num_items)
             encoder_outputs.extend(batch_outputs)
         return encoder_outputs
@@ -140,9 +144,13 @@ class EncoderRunner:
         mm_embeds: list[torch.Tensor],
         is_mm_embed: torch.Tensor,
     ) -> torch.Tensor:
+        _t = time.perf_counter()
         x = self.model.embed_input_ids(
             input_ids, multimodal_embeddings=mm_embeds, is_multimodal=is_mm_embed
         )
+        print(f"[vllm_prepare_input] mm.encoder_runner.embed_input_ids {(time.perf_counter() - _t) * 1000:.3f} ms tokens={input_ids.shape[0]} embeds={len(mm_embeds)}", flush=True)
+        _t = time.perf_counter()
         # Copy to the pre-allocated buffer for CUDA graphs.
         self.inputs_embeds[: x.shape[0]] = x
+        print(f"[vllm_prepare_input] mm.encoder_runner.copy_inputs_embeds {(time.perf_counter() - _t) * 1000:.3f} ms", flush=True)
         return self.inputs_embeds

@@ -688,6 +688,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def prepare_inputs(
         self, scheduler_output: SchedulerOutput, batch_desc: BatchExecutionDescriptor
     ) -> InputBatch:
+        _prepare_inputs_start = time.perf_counter()
+        _t = time.perf_counter()
         num_tokens = scheduler_output.total_num_scheduled_tokens
         num_tokens_after_padding = batch_desc.num_tokens
         assert num_tokens > 0
@@ -703,8 +705,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         idx_mapping_iter = map(self.req_states.req_id_to_index.get, req_ids)
         idx_mapping_np = np.fromiter(idx_mapping_iter, dtype=np.int32, count=num_reqs)
         idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
+        print(f"[vllm_prepare_input] prepare_inputs.batch_assembly_and_idx_copy {(time.perf_counter() - _t) * 1000:.3f} ms tokens={num_tokens} reqs={num_reqs}", flush=True)
 
         # Get the number of draft tokens for each request.
+        _t = time.perf_counter()
         draft_tokens = scheduler_output.scheduled_spec_decode_tokens
         if not draft_tokens:
             # No draft token scheduled (common case).
@@ -737,9 +741,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
                 idx_mapping, total_num_logits, cu_num_logits, max_expand_len
             )
+        print(f"[vllm_prepare_input] prepare_inputs.logits_metadata {(time.perf_counter() - _t) * 1000:.3f} ms draft_tokens={total_num_draft_tokens}", flush=True)
 
         # Get query_start_loc.
         # num_reqs_padded is None for PIECEWISE graphs (no request padding needed)
+        _t = time.perf_counter()
         num_reqs_padded = batch_desc.num_reqs or num_reqs
         query_start_loc_np = np.empty(self.max_num_reqs + 1, dtype=np.int32)
         query_start_loc_np[0] = 0
@@ -750,9 +756,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         async_copy_to_gpu(query_start_loc_np, out=self.input_buffers.query_start_loc)
         query_start_loc_np = query_start_loc_np[: num_reqs_padded + 1]
         query_start_loc = self.input_buffers.query_start_loc[: num_reqs_padded + 1]
+        print(f"[vllm_prepare_input] prepare_inputs.query_start_loc_copy {(time.perf_counter() - _t) * 1000:.3f} ms", flush=True)
 
         # Get prefill tokens if any.
         if self.req_states.any_prefills(idx_mapping_np):
+            _t = time.perf_counter()
             prepare_prefill_inputs(
                 self.input_buffers.input_ids,
                 self.req_states.next_prefill_tokens,
@@ -762,8 +770,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.req_states.prefill_len.gpu,
                 self.req_states.num_computed_tokens.gpu,
             )
+            print(f"[vllm_prepare_input] prepare_inputs.prefill_input_ids {(time.perf_counter() - _t) * 1000:.3f} ms", flush=True)
 
         # Prepare positions and seq_lens.
+        _t = time.perf_counter()
         prepare_pos_seq_lens(
             idx_mapping,
             query_start_loc,
@@ -772,10 +782,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.input_buffers.seq_lens,
         )
         seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
+        print(f"[vllm_prepare_input] prepare_inputs.positions_seq_lens {(time.perf_counter() - _t) * 1000:.3f} ms", flush=True)
 
         dcp_local_seq_lens = None
         if self.use_dcp:
             # Prepare dcp local seq_lens.
+            _t = time.perf_counter()
             prepare_dcp_local_seq_lens(
                 self.input_buffers.dcp_local_seq_lens,
                 self.input_buffers.seq_lens,
@@ -785,9 +797,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.cp_interleave,
             )
             dcp_local_seq_lens = self.input_buffers.dcp_local_seq_lens[:num_reqs_padded]
+            print(f"[vllm_prepare_input] prepare_inputs.dcp_local_seq_lens {(time.perf_counter() - _t) * 1000:.3f} ms", flush=True)
 
         # Some input token ids are directly read from the last sampled tokens
         # and draft tokens. Also, get the logits indices to sample tokens from.
+        _t = time.perf_counter()
         logits_indices = combine_sampled_and_draft_tokens(
             self.input_buffers.input_ids,
             idx_mapping,
@@ -799,8 +813,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cu_num_logits,
             total_num_logits,
         )
+        print(f"[vllm_prepare_input] prepare_inputs.logits_indices {(time.perf_counter() - _t) * 1000:.3f} ms", flush=True)
 
         # CPU upper bound on seq_lens; padded entries left at zero.
+        _t = time.perf_counter()
         seq_lens_cpu_upper_bound_np = np.zeros(num_reqs_padded, dtype=np.int32)
         np.add(
             self.req_states.num_computed_tokens_np[idx_mapping_np],
@@ -808,6 +824,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             out=seq_lens_cpu_upper_bound_np[:num_reqs],
         )
         seq_lens_cpu_upper_bound = torch.from_numpy(seq_lens_cpu_upper_bound_np)
+        print(f"[vllm_prepare_input] prepare_inputs.seq_lens_cpu_upper_bound {(time.perf_counter() - _t) * 1000:.3f} ms", flush=True)
+        print(f"[vllm_prepare_input] prepare_inputs.total {(time.perf_counter() - _prepare_inputs_start) * 1000:.3f} ms tokens={num_tokens} padded_tokens={num_tokens_after_padding} reqs={num_reqs}", flush=True)
 
         return InputBatch(
             req_ids=req_ids,
@@ -954,11 +972,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if not dummy_run:
             # Update the request states.
+            _t = time.perf_counter()
             self.finish_requests(scheduler_output)
             self.free_states(scheduler_output)
             self.add_requests(scheduler_output)
             self.update_requests(scheduler_output)
             self.block_tables.apply_staged_writes()
+            print(f"[vllm_prepare_input] execute_model.request_state_update {(time.perf_counter() - _t) * 1000:.3f} ms", flush=True)
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.
                 empty_output = self.kv_connector.no_forward(scheduler_output)
@@ -977,6 +997,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # cross-attention cache with dynamic encoder outputs.
             skip_compiled = True
 
+        _t = time.perf_counter()
         batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
             self.cudagraph_manager,
             num_reqs,
@@ -986,6 +1007,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.dp_rank,
             need_eager=is_profile or skip_compiled,
         )
+        print(f"[vllm_prepare_input] execute_model.batch_descriptor {(time.perf_counter() - _t) * 1000:.3f} ms tokens={num_toks} reqs={num_reqs}", flush=True)
 
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.
@@ -995,8 +1017,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if not dummy_run:
             # Common case.
             # Prepare all the inputs and copy to the input buffers.
+            _t = time.perf_counter()
             input_batch = self.prepare_inputs(scheduler_output, batch_desc)
+            print(f"[vllm_prepare_input] execute_model.prepare_inputs {(time.perf_counter() - _t) * 1000:.3f} ms", flush=True)
+            _t = time.perf_counter()
             block_tables, slot_mappings = self.prepare_attn(input_batch)
+            print(f"[vllm_prepare_input] execute_model.prepare_attn {(time.perf_counter() - _t) * 1000:.3f} ms", flush=True)
 
             if self.lora_config:
                 # Activate LoRA adapters.
@@ -1028,10 +1054,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         slot_mappings_by_layer = None
         if not (dummy_run and skip_attn_for_dummy_run):
             assert slot_mappings is not None
+            _t = time.perf_counter()
             slot_mappings_by_layer = build_slot_mappings_by_layer(
                 slot_mappings, self.kv_cache_config
             )
+            print(f"[vllm_prepare_input] execute_model.build_slot_mappings_by_layer {(time.perf_counter() - _t) * 1000:.3f} ms", flush=True)
             assert block_tables is not None
+            _t = time.perf_counter()
             attn_metadata = self.model_state.prepare_attn(
                 input_batch,
                 batch_desc.cg_mode,
@@ -1040,6 +1069,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.attn_groups,
                 self.kv_cache_config,
             )
+            print(f"[vllm_prepare_input] execute_model.model_state_prepare_attn {(time.perf_counter() - _t) * 1000:.3f} ms", flush=True)
 
         inputs_embeds = None
         if self.supports_mm_inputs and self.is_first_pp_rank:
@@ -1047,12 +1077,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Only first PP rank prepares multimodal embeddings.
             # NOTE(woosuk): We must call get_mm_embeddings even during dummy runs
             # to obtain inputs_embeds, because the compiled model expects this input.
+            _t = time.perf_counter()
             inputs_embeds = self.model_state.get_mm_embeddings(
                 scheduler_output.scheduled_encoder_inputs,
                 input_batch,
                 self.req_states,
             )
+            print(f"[vllm_prepare_input] execute_model.prepare_mm_embeddings {(time.perf_counter() - _t) * 1000:.3f} ms", flush=True)
 
+        _t = time.perf_counter()
         model_inputs = {
             "input_ids": input_batch.input_ids,
             "positions": input_batch.positions,
@@ -1061,6 +1094,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # values above.
             **self.model_state.prepare_inputs(input_batch, self.req_states),
         }
+        print(f"[vllm_prepare_input] execute_model.model_state_prepare_inputs {(time.perf_counter() - _t) * 1000:.3f} ms", flush=True)
         if not self.is_first_pp_rank:
             # Update for non-first PP ranks.
             model_inputs["input_ids"] = None
@@ -1084,8 +1118,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
             # because they are already copied to the CUDA graph input buffers.
             assert self.cudagraph_manager is not None
+            _t = time.perf_counter()
             self.kv_connector.pre_forward(scheduler_output)
             model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
+            print(f"[vllm_prepare_input] execute_model.forward {(time.perf_counter() - _t) * 1000:.3f} ms", flush=True)
         else:
             # For piecewise and eager mode, just call model().
             batch_descriptor = BatchDescriptor(
@@ -1103,8 +1139,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 slot_mapping=slot_mappings_by_layer,
                 skip_compiled=skip_compiled,
             ):
+                _t = time.perf_counter()
                 self.kv_connector.pre_forward(scheduler_output)
                 model_output = self.model(**model_inputs)
+                print(f"[vllm_prepare_input] execute_model.forward {(time.perf_counter() - _t) * 1000:.3f} ms", flush=True)
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
