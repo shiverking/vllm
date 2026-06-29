@@ -88,6 +88,13 @@ class TranscriptionRequest(OpenAIBaseModel):
     should match the audio language.
     """
 
+    response_prefix: str = Field(default="")
+    """Optional text to prepend to the model's response, as if it had already
+    been generated. Models that support this field can use it to continue from
+    caller-provided stable output, which is useful for implementing streaming
+    transcription on the caller side.
+    """
+
     response_format: AudioResponseFormat = Field(default="json")
     """
     The format of the output, in one of these options: `json`, `text`, `srt`,
@@ -208,6 +215,7 @@ class TranscriptionRequest(OpenAIBaseModel):
             request_prompt=self.prompt,
             to_language=self.to_language,
             hotwords=self.hotwords,
+            response_prefix=self.response_prefix,
         )
 
     def to_beam_search_params(

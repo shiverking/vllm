@@ -50,6 +50,11 @@ class SpeechToTextParams:
     to_language: str | None = None
     """Target language for translation (model-dependent)."""
 
+    response_prefix: str = ""
+    """Optional text to prepend to the model's response, as if it had already
+    been generated. Models that support this field can use it to continue
+    generation from caller-provided stable output."""
+
 
 @config
 class SpeechToTextConfig:

@@ -22,6 +22,7 @@
 # limitations under the License.
 """Inference-only Qwen3-ASR model."""
 
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
@@ -90,6 +91,20 @@ from vllm.transformers_utils.processors.qwen3_asr import (
 
 logger = init_logger(__name__)
 _ASR_TEXT_TAG = "<asr_text>"
+_CHATML_LIKE_TOKEN = re.compile(r"<\|[^|]+\|>")
+
+
+def _sanitize_transcription_user_text(text: str) -> str:
+    """Strip prompt-control tokens from user-controlled transcription fields."""
+    if not text:
+        return ""
+
+    prev = None
+    while prev != text:
+        prev = text
+        text = text.replace(_ASR_TEXT_TAG, "")
+        text = _CHATML_LIKE_TOKEN.sub("", text)
+    return text
 
 
 def _get_feat_extract_output_lengths(input_lengths: torch.Tensor):
@@ -553,8 +568,10 @@ class Qwen3ASRForConditionalGeneration(
         """Get the generation prompt to be used for transcription requests."""
         audio = stt_params.audio
         model_config = stt_params.model_config
+        language = stt_params.language
         task_type = stt_params.task_type
         to_language = stt_params.to_language
+        response_prefix = stt_params.response_prefix
         tokenizer = cached_tokenizer_from_config(model_config)
         audio_placeholder = cls.get_placeholder_str("audio", 0)
 
@@ -563,17 +580,19 @@ class Qwen3ASRForConditionalGeneration(
                 f"Unsupported task_type '{task_type}'. "
                 "Supported task types are 'transcribe' and 'translate'."
             )
-        full_lang_name_to = cls.supported_languages.get(to_language, to_language)
-        if to_language is None:
-            prompt = (
-                f"<|im_start|>user\n{audio_placeholder}<|im_end|>\n"
-                f"<|im_start|>assistant\n"
+        prefix = _sanitize_transcription_user_text(response_prefix)
+        prompt = (
+            f"<|im_start|>user\n{audio_placeholder}<|im_end|>\n"
+            f"<|im_start|>assistant\n"
+        )
+
+        lang_code = to_language if task_type == "translate" else language
+        if lang_code is not None:
+            full_lang_name = _sanitize_transcription_user_text(
+                cls.supported_languages.get(lang_code, lang_code)
             )
-        else:
-            prompt = (
-                f"<|im_start|>user\n{audio_placeholder}<|im_end|>\n"
-                f"<|im_start|>assistant\nlanguage {full_lang_name_to}{_ASR_TEXT_TAG}"
-            )
+            prompt += f"language {full_lang_name}{_ASR_TEXT_TAG}"
+        prompt += prefix
 
         prompt_token_ids = tokenizer.encode(prompt)
 
