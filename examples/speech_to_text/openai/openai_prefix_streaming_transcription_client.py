@@ -136,6 +136,13 @@ def print_delta(state: PrefixStreamingState, start_time: float) -> bool:
     return bool(delta)
 
 
+def build_audio_endpoint_url(api_base: str, endpoint: str) -> str:
+    base = api_base.rstrip("/")
+    if base.endswith("/audio"):
+        return f"{base}/{endpoint}"
+    return f"{base}/audio/{endpoint}"
+
+
 def post_audio_request(
     *,
     api_base: str,
@@ -165,7 +172,7 @@ def post_audio_request(
     files = {"file": ("audio.wav", wav_buffer, "audio/wav")}
     request_start = time.perf_counter()
     response = requests.post(
-        f"{api_base.rstrip('/')}/audio/{endpoint}",
+        build_audio_endpoint_url(api_base, endpoint),
         data=data,
         files=files,
         timeout=timeout,
@@ -182,7 +189,10 @@ def post_audio_request(
 
 def run_prefix_streaming(args: argparse.Namespace) -> None:
     e2e_start = time.perf_counter()
-    audio, sample_rate = load_audio(args.audio_path, sr=args.sample_rate, mono=True)
+    audio_path = args.audio_path
+    if audio_path is None:
+        audio_path = str(AudioAsset("mary_had_lamb").get_local_path())
+    audio, sample_rate = load_audio(audio_path, sr=args.sample_rate, mono=True)
     chunk_samples = max(1, int(args.chunk_seconds * sample_rate))
     max_window_samples = (
         int(args.max_audio_window_seconds * sample_rate)
@@ -199,7 +209,7 @@ def run_prefix_streaming(args: argparse.Namespace) -> None:
     audio_duration_s = len(audio) / sample_rate
     print(
         "[setup] "
-        f"audio={args.audio_path} duration={audio_duration_s:.2f}s "
+        f"audio={audio_path} duration={audio_duration_s:.2f}s "
         f"sample_rate={sample_rate} chunk={args.chunk_seconds:.2f}s "
         f"holdback_words={args.holdback_words} "
         f"max_prefix_words={args.max_prefix_words} "
@@ -324,11 +334,10 @@ def run_prefix_streaming(args: argparse.Namespace) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    default_audio = str(AudioAsset("mary_had_lamb").get_local_path())
     parser = argparse.ArgumentParser(
         description="REST prefix-streaming transcription client for vLLM."
     )
-    parser.add_argument("--audio-path", default=default_audio)
+    parser.add_argument("--audio-path", default=None)
     parser.add_argument("--api-base", default="http://localhost:8000/v1")
     parser.add_argument("--model", default="Qwen3-ASR-1.7B")
     parser.add_argument(
