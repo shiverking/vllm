@@ -17,6 +17,7 @@ import difflib
 import json
 import re
 import time
+import unicodedata
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -50,6 +51,16 @@ def normalize_text(text: str) -> str:
 
 def compact_text(text: str) -> str:
     return re.sub(r"\s+", "", normalize_text(text))
+
+
+def content_text(text: str) -> str:
+    chars: list[str] = []
+    for char in compact_text(text):
+        category = unicodedata.category(char)
+        if category[0] in {"P", "S"}:
+            continue
+        chars.append(char)
+    return "".join(chars)
 
 
 def infer_optional_language(audio_path: Path, configured_language: str) -> str | None:
@@ -125,6 +136,22 @@ def split_with_dual_holdback(
     stable_by_chars = text[:-holdback_chars]
     stable_len = min(len(stable_by_words), len(stable_by_chars))
     return text[:stable_len].rstrip(), text[stable_len:]
+
+
+def split_with_language_holdback(
+    text: str,
+    language: str,
+    holdback_words: int,
+    holdback_chars: int,
+) -> tuple[str, str]:
+    if language == "zh":
+        if holdback_chars <= 0:
+            return text, ""
+        if len(text) <= holdback_chars:
+            return "", text
+        return text[:-holdback_chars].rstrip(), text[-holdback_chars:]
+
+    return split_with_dual_holdback(text, holdback_words, 0)
 
 
 def has_repeated_char_ngram(
@@ -224,6 +251,8 @@ def build_similarity_metrics(
     batched_norm = normalize_text(batched_text)
     baseline_compact = compact_text(baseline_text)
     batched_compact = compact_text(batched_text)
+    baseline_content = content_text(baseline_text)
+    batched_content = content_text(batched_text)
 
     return {
         "char_similarity": sequence_ratio(baseline_norm, batched_norm),
@@ -231,11 +260,16 @@ def build_similarity_metrics(
             baseline_compact,
             batched_compact,
         ),
+        "content_similarity": sequence_ratio(
+            baseline_content,
+            batched_content,
+        ),
         "word_similarity": sequence_ratio(
             " ".join(baseline_norm.split()),
             " ".join(batched_norm.split()),
         ),
         "cer": error_rate(baseline_compact, batched_compact),
+        "content_cer": error_rate(baseline_content, batched_content),
         "wer": word_error_rate(baseline_norm, batched_norm),
         "baseline_chars": len(baseline_text),
         "batched_chars": len(batched_text),
@@ -360,14 +394,16 @@ def update_state_from_result(
     state: prefix_client.PrefixStreamingState,
     prefix: str,
     result_text: str,
+    language: str,
     args: argparse.Namespace,
 ) -> None:
     candidate_text = prefix_client.merge_history_and_candidate(
         state.stable_text,
         prefix_client.merge_prefix_and_response(prefix, result_text),
     )
-    state.stable_text, state.unstable_text = split_with_dual_holdback(
+    state.stable_text, state.unstable_text = split_with_language_holdback(
         candidate_text,
+        language,
         args.holdback_words,
         args.holdback_chars,
     )
@@ -428,7 +464,13 @@ def run_batched_prefix_streaming(
         )
         drop_reasons = build_drop_reasons(result, args)
         if not drop_reasons:
-            update_state_from_result(state, prefix, result["text"], args)
+            update_state_from_result(
+                state,
+                prefix,
+                result["text"],
+                language,
+                args,
+            )
 
         round_info = {
             "round": round_idx,
@@ -503,7 +545,7 @@ def run_batched_prefix_streaming(
 
     dropped_rounds = [r for r in rounds if r["drop_reasons"]]
     return {
-        "text": state.stable_text,
+        "text": state.display_text,
         "e2e_ms": seconds_to_ms(time.perf_counter() - start_time),
         "status": "degraded" if dropped_rounds else "success",
         "rounds": rounds,
@@ -560,11 +602,17 @@ def compare_one_audio(
         f"status={batched['status']} "
         f"char_similarity={metrics['char_similarity']:.4f} "
         f"compact_char_similarity={metrics['compact_char_similarity']:.4f} "
+        f"content_similarity={metrics['content_similarity']:.4f} "
         f"cer={fmt_float(metrics['cer'])} "
+        f"content_cer={fmt_float(metrics['content_cer'])} "
         f"wer={fmt_float(metrics['wer'])} "
         f"dropped_rounds={batched['dropped_rounds']}",
         flush=True,
     )
+    print("\n[baseline-text]")
+    print(single["text"])
+    print("\n[batched-final-text]")
+    print(batched["text"])
 
     result: dict[str, Any] = {
         "file": audio_path.name,
@@ -587,6 +635,11 @@ def print_summary(results: list[dict[str, Any]]) -> None:
         for r in results
         if r["similarity"]["compact_char_similarity"] is not None
     ]
+    content_similarities = [
+        r["similarity"]["content_similarity"]
+        for r in results
+        if r["similarity"]["content_similarity"] is not None
+    ]
     cers = [
         r["similarity"]["cer"]
         for r in results
@@ -596,6 +649,11 @@ def print_summary(results: list[dict[str, Any]]) -> None:
         r["similarity"]["wer"]
         for r in results
         if r["similarity"]["wer"] is not None
+    ]
+    content_cers = [
+        r["similarity"]["content_cer"]
+        for r in results
+        if r["similarity"]["content_cer"] is not None
     ]
     degraded = sum(1 for r in results if r["batched"]["status"] == "degraded")
     dropped_rounds = sum(r["batched"]["dropped_rounds"] for r in results)
@@ -607,7 +665,9 @@ def print_summary(results: list[dict[str, Any]]) -> None:
     print(f"Batched degraded: {degraded}")
     print(f"Dropped batched rounds: {dropped_rounds}")
     print(f"Compact char similarity: {summarize(compact_similarities)}")
+    print(f"Content similarity: {summarize(content_similarities)}")
     print(f"CER: {summarize(cers)}")
+    print(f"Content CER: {summarize(content_cers)}")
     print(f"WER: {summarize(wers)}")
     print("=" * 64)
 
@@ -637,7 +697,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-prefix-words", type=int, default=100)
     parser.add_argument("--max-prefix-chars", type=int, default=800)
     parser.add_argument("--holdback-words", type=int, default=5)
-    parser.add_argument("--holdback-chars", type=int, default=0)
+    parser.add_argument(
+        "--holdback-chars",
+        type=int,
+        default=80,
+        help="Used for Chinese holdback. English keeps word holdback by default.",
+    )
     parser.add_argument("--single-max-tokens", type=int, default=4096)
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--final-max-tokens", type=int, default=1024)
@@ -703,6 +768,16 @@ def main() -> None:
                     r["similarity"]["cer"]
                     for r in results
                     if r["similarity"]["cer"] is not None
+                ]
+            ),
+            "content_similarity": summarize(
+                [r["similarity"]["content_similarity"] for r in results]
+            ),
+            "content_cer": summarize(
+                [
+                    r["similarity"]["content_cer"]
+                    for r in results
+                    if r["similarity"]["content_cer"] is not None
                 ]
             ),
             "wer": summarize(
