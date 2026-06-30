@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 import time
 import wave
 from dataclasses import dataclass
@@ -36,7 +37,7 @@ class PrefixStreamingState:
     stable_text: str = ""
     unstable_text: str = ""
     last_printed_text: str = ""
-    first_delta_s: float | None = None
+    ttft_ms: float | None = None
 
     @property
     def display_text(self) -> str:
@@ -46,8 +47,9 @@ class PrefixStreamingState:
 @dataclass
 class RequestResult:
     text: str
-    latency_s: float
-    upload_audio_s: float
+    latency_ms: float
+    ttft_ms: float | None
+    upload_audio_ms: float
     upload_bytes: int
 
 
@@ -124,13 +126,36 @@ def merge_prefix_and_response(prefix: str, response_text: str) -> str:
     return append_with_spacing(prefix, response_text)
 
 
-def print_delta(state: PrefixStreamingState, start_time: float) -> bool:
+def merge_history_and_candidate(history: str, candidate_text: str) -> str:
+    candidate_text = candidate_text or ""
+    if not history:
+        return candidate_text
+    if not candidate_text:
+        return history
+
+    if candidate_text.startswith(history):
+        return candidate_text
+
+    if history.endswith(candidate_text):
+        return history
+
+    overlap_limit = min(len(history), len(candidate_text))
+    for overlap in range(overlap_limit, 0, -1):
+        if history[-overlap:] == candidate_text[:overlap]:
+            return history + candidate_text[overlap:]
+
+    return append_with_spacing(history, candidate_text)
+
+
+def seconds_to_ms(seconds: float) -> float:
+    return seconds * 1000.0
+
+
+def print_delta(state: PrefixStreamingState) -> bool:
     display_text = state.display_text
     delta_start = common_prefix_len(state.last_printed_text, display_text)
     delta = display_text[delta_start:]
     if delta:
-        if state.first_delta_s is None:
-            state.first_delta_s = time.perf_counter() - start_time
         print(delta, end="", flush=True)
     state.last_printed_text = display_text
     return bool(delta)
@@ -143,6 +168,18 @@ def build_audio_endpoint_url(api_base: str, endpoint: str) -> str:
     return f"{base}/audio/{endpoint}"
 
 
+def extract_stream_delta(payload: dict[str, Any]) -> str:
+    choices = payload.get("choices") or []
+    if not choices:
+        return ""
+
+    delta = choices[0].get("delta") or {}
+    content = delta.get("content")
+    if content is None:
+        return ""
+    return content
+
+
 def post_audio_request(
     *,
     api_base: str,
@@ -153,6 +190,7 @@ def post_audio_request(
     language: str | None,
     to_language: str | None,
     response_prefix: str,
+    stream: bool,
     temperature: float,
     timeout: float,
 ) -> RequestResult:
@@ -160,6 +198,7 @@ def post_audio_request(
         "model": model,
         "response_format": "json",
         "response_prefix": response_prefix,
+        "stream": "true" if stream else "false",
         "temperature": temperature,
     }
     if language:
@@ -175,14 +214,39 @@ def post_audio_request(
         build_audio_endpoint_url(api_base, endpoint),
         data=data,
         files=files,
+        stream=stream,
         timeout=timeout,
     )
-    latency_s = time.perf_counter() - request_start
     response.raise_for_status()
+
+    ttft_ms: float | None = None
+    if stream:
+        text_parts: list[str] = []
+        for line in response.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+            if line.startswith("data: "):
+                line = line[len("data: ") :]
+            if line.strip() == "[DONE]":
+                break
+
+            payload = json.loads(line)
+            delta = extract_stream_delta(payload)
+            if delta:
+                if ttft_ms is None:
+                    ttft_ms = seconds_to_ms(time.perf_counter() - request_start)
+                text_parts.append(delta)
+
+        text = "".join(text_parts)
+    else:
+        text = response.json()["text"]
+
+    latency_ms = seconds_to_ms(time.perf_counter() - request_start)
     return RequestResult(
-        text=response.json()["text"],
-        latency_s=latency_s,
-        upload_audio_s=len(audio) / sample_rate,
+        text=text,
+        latency_ms=latency_ms,
+        ttft_ms=ttft_ms,
+        upload_audio_ms=seconds_to_ms(len(audio) / sample_rate),
         upload_bytes=upload_bytes,
     )
 
@@ -201,19 +265,23 @@ def run_prefix_streaming(args: argparse.Namespace) -> None:
     )
     state = PrefixStreamingState()
     endpoint = "translations" if args.task == "translate" else "transcriptions"
-    total_uploaded_audio_s = 0.0
+    total_uploaded_audio_ms = 0.0
     total_uploaded_bytes = 0
-    request_latencies: list[float] = []
+    request_latencies_ms: list[float] = []
+    first_audio_request_start: float | None = None
     round_idx = 0
 
     audio_duration_s = len(audio) / sample_rate
     print(
         "[setup] "
-        f"audio={audio_path} duration={audio_duration_s:.2f}s "
-        f"sample_rate={sample_rate} chunk={args.chunk_seconds:.2f}s "
+        f"audio={audio_path} duration_ms={seconds_to_ms(audio_duration_s):.0f} "
+        f"sample_rate={sample_rate} "
+        f"chunk_ms={seconds_to_ms(args.chunk_seconds):.0f} "
+        f"stream={args.stream} "
         f"holdback_words={args.holdback_words} "
         f"max_prefix_words={args.max_prefix_words} "
-        f"max_audio_window_seconds={args.max_audio_window_seconds:.2f}"
+        "max_audio_window_ms="
+        f"{seconds_to_ms(args.max_audio_window_seconds):.0f}"
     )
 
     print("Transcription: ", end="", flush=True)
@@ -231,14 +299,17 @@ def run_prefix_streaming(args: argparse.Namespace) -> None:
         print(
             "\n"
             f"[round {round_idx}] request "
-            f"audio_window={audio_start_s:.2f}-{audio_end_s:.2f}s "
-            f"upload_audio={(end - start) / sample_rate:.2f}s "
+            "audio_window_ms="
+            f"{seconds_to_ms(audio_start_s):.0f}-{seconds_to_ms(audio_end_s):.0f} "
+            f"upload_audio_ms={seconds_to_ms((end - start) / sample_rate):.0f} "
             f"prefix_words={prefix_words} "
             f"stable_words={len(state.stable_text.split())} "
             f"unstable_words={len(state.unstable_text.split())}",
             flush=True,
         )
 
+        if first_audio_request_start is None:
+            first_audio_request_start = time.perf_counter()
         result = post_audio_request(
             api_base=args.api_base,
             endpoint=endpoint,
@@ -248,22 +319,35 @@ def run_prefix_streaming(args: argparse.Namespace) -> None:
             language=args.language,
             to_language=args.to_language,
             response_prefix=prefix,
+            stream=args.stream,
             temperature=args.temperature,
             timeout=args.timeout,
         )
-        total_uploaded_audio_s += result.upload_audio_s
+        total_uploaded_audio_ms += result.upload_audio_ms
         total_uploaded_bytes += result.upload_bytes
-        request_latencies.append(result.latency_s)
-        candidate_text = merge_prefix_and_response(prefix, result.text)
+        request_latencies_ms.append(result.latency_ms)
+        candidate_text = merge_history_and_candidate(
+            state.display_text,
+            merge_prefix_and_response(prefix, result.text),
+        )
         stable_text, unstable_text = split_with_holdback(
             candidate_text,
             args.holdback_words,
         )
         state.stable_text = stable_text
         state.unstable_text = unstable_text
+        has_display_text = bool(state.display_text)
+        if state.ttft_ms is None and result.ttft_ms is not None:
+            state.ttft_ms = result.ttft_ms
+        elif state.ttft_ms is None and has_display_text:
+            assert first_audio_request_start is not None
+            state.ttft_ms = seconds_to_ms(
+                time.perf_counter() - first_audio_request_start
+            )
         print(
             f"[round {round_idx}] response "
-            f"latency={result.latency_s:.3f}s "
+            f"latency_ms={result.latency_ms:.0f} "
+            f"ttft_ms={result.ttft_ms if result.ttft_ms is not None else -1:.0f} "
             f"upload_bytes={result.upload_bytes} "
             f"response_words={len(result.text.split())} "
             f"new_stable_words={len(state.stable_text.split())} "
@@ -271,7 +355,7 @@ def run_prefix_streaming(args: argparse.Namespace) -> None:
             flush=True,
         )
         print("[delta] ", end="", flush=True)
-        print_delta(state, e2e_start)
+        print_delta(state)
         print()
 
         if end >= len(audio):
@@ -285,7 +369,7 @@ def run_prefix_streaming(args: argparse.Namespace) -> None:
     print(
         "\n"
         "[final] request "
-        f"upload_audio={len(final_audio) / sample_rate:.2f}s "
+        f"upload_audio_ms={seconds_to_ms(len(final_audio) / sample_rate):.0f} "
         f"prefix_words={len(final_prefix.split())}",
         flush=True,
     )
@@ -298,37 +382,51 @@ def run_prefix_streaming(args: argparse.Namespace) -> None:
         language=args.language,
         to_language=args.to_language,
         response_prefix=final_prefix,
+        stream=args.stream,
         temperature=args.temperature,
         timeout=args.timeout,
     )
-    total_uploaded_audio_s += final_result.upload_audio_s
+    total_uploaded_audio_ms += final_result.upload_audio_ms
     total_uploaded_bytes += final_result.upload_bytes
-    request_latencies.append(final_result.latency_s)
-    state.stable_text = merge_prefix_and_response(final_prefix, final_result.text)
+    request_latencies_ms.append(final_result.latency_ms)
+    state.stable_text = merge_history_and_candidate(
+        state.display_text,
+        merge_prefix_and_response(final_prefix, final_result.text),
+    )
     state.unstable_text = ""
+    if state.ttft_ms is None and state.display_text:
+        if final_result.ttft_ms is not None:
+            state.ttft_ms = final_result.ttft_ms
+        else:
+            assert first_audio_request_start is not None
+            state.ttft_ms = seconds_to_ms(
+                time.perf_counter() - first_audio_request_start
+            )
     print(
         "[final] response "
-        f"latency={final_result.latency_s:.3f}s "
+        f"latency_ms={final_result.latency_ms:.0f} "
+        "ttft_ms="
+        f"{final_result.ttft_ms if final_result.ttft_ms is not None else -1:.0f} "
         f"upload_bytes={final_result.upload_bytes} "
         f"response_words={len(final_result.text.split())}",
         flush=True,
     )
     print("[delta] ", end="", flush=True)
-    print_delta(state, e2e_start)
+    print_delta(state)
     print()
 
-    e2e_s = time.perf_counter() - e2e_start
-    avg_latency_s = sum(request_latencies) / len(request_latencies)
-    max_latency_s = max(request_latencies)
+    e2e_ms = seconds_to_ms(time.perf_counter() - e2e_start)
+    avg_latency_ms = sum(request_latencies_ms) / len(request_latencies_ms)
+    max_latency_ms = max(request_latencies_ms)
     print(f"\n\nFinal {args.task} result:\n{state.stable_text}")
     print(
         "\n[metrics] "
-        f"ttft={state.first_delta_s if state.first_delta_s is not None else -1:.3f}s "
-        f"e2e={e2e_s:.3f}s "
-        f"requests={len(request_latencies)} "
-        f"avg_request_latency={avg_latency_s:.3f}s "
-        f"max_request_latency={max_latency_s:.3f}s "
-        f"uploaded_audio={total_uploaded_audio_s:.2f}s "
+        f"ttft_ms={state.ttft_ms if state.ttft_ms is not None else -1:.0f} "
+        f"e2e_ms={e2e_ms:.0f} "
+        f"requests={len(request_latencies_ms)} "
+        f"avg_request_latency_ms={avg_latency_ms:.0f} "
+        f"max_request_latency_ms={max_latency_ms:.0f} "
+        f"uploaded_audio_ms={total_uploaded_audio_ms:.0f} "
         f"uploaded_bytes={total_uploaded_bytes}"
     )
 
@@ -351,6 +449,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chunk-seconds", type=float, default=2.0)
     parser.add_argument("--holdback-words", type=int, default=5)
     parser.add_argument("--max-prefix-words", type=int, default=100)
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="Use the REST endpoint's SSE stream and record first-delta TTFT.",
+    )
     parser.add_argument(
         "--max-audio-window-seconds",
         type=float,
