@@ -327,7 +327,7 @@ def run_prefix_streaming(args: argparse.Namespace) -> None:
         total_uploaded_bytes += result.upload_bytes
         request_latencies_ms.append(result.latency_ms)
         candidate_text = merge_history_and_candidate(
-            state.display_text,
+            state.stable_text,
             merge_prefix_and_response(prefix, result.text),
         )
         stable_text, unstable_text = split_with_holdback(
@@ -390,7 +390,7 @@ def run_prefix_streaming(args: argparse.Namespace) -> None:
     total_uploaded_bytes += final_result.upload_bytes
     request_latencies_ms.append(final_result.latency_ms)
     state.stable_text = merge_history_and_candidate(
-        state.display_text,
+        state.stable_text,
         merge_prefix_and_response(final_prefix, final_result.text),
     )
     state.unstable_text = ""
