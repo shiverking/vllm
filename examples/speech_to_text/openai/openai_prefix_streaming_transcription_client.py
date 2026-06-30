@@ -206,40 +206,42 @@ def post_audio_request(
     if to_language:
         data["to_language"] = to_language
 
-    wav_buffer = audio_to_wav_buffer(audio, sample_rate)
-    upload_bytes = wav_buffer.getbuffer().nbytes
-    files = {"file": ("audio.wav", wav_buffer, "audio/wav")}
     request_start = time.perf_counter()
-    response = requests.post(
-        build_audio_endpoint_url(api_base, endpoint),
-        data=data,
-        files=files,
-        stream=stream,
-        timeout=timeout,
-    )
-    response.raise_for_status()
-
     ttft_ms: float | None = None
-    if stream:
-        text_parts: list[str] = []
-        for line in response.iter_lines(decode_unicode=True):
-            if not line:
-                continue
-            if line.startswith("data: "):
-                line = line[len("data: ") :]
-            if line.strip() == "[DONE]":
-                break
+    with audio_to_wav_buffer(audio, sample_rate) as wav_buffer:
+        upload_bytes = wav_buffer.getbuffer().nbytes
+        files = {"file": ("audio.wav", wav_buffer, "audio/wav")}
+        with requests.post(
+            build_audio_endpoint_url(api_base, endpoint),
+            data=data,
+            files=files,
+            stream=stream,
+            timeout=timeout,
+        ) as response:
+            response.raise_for_status()
 
-            payload = json.loads(line)
-            delta = extract_stream_delta(payload)
-            if delta:
-                if ttft_ms is None:
-                    ttft_ms = seconds_to_ms(time.perf_counter() - request_start)
-                text_parts.append(delta)
+            if stream:
+                text_parts: list[str] = []
+                for line in response.iter_lines(decode_unicode=True):
+                    if not line:
+                        continue
+                    if line.startswith("data: "):
+                        line = line[len("data: ") :]
+                    if line.strip() == "[DONE]":
+                        break
 
-        text = "".join(text_parts)
-    else:
-        text = response.json()["text"]
+                    payload = json.loads(line)
+                    delta = extract_stream_delta(payload)
+                    if delta:
+                        if ttft_ms is None:
+                            ttft_ms = seconds_to_ms(
+                                time.perf_counter() - request_start
+                            )
+                        text_parts.append(delta)
+
+                text = "".join(text_parts)
+            else:
+                text = response.json()["text"]
 
     latency_ms = seconds_to_ms(time.perf_counter() - request_start)
     return RequestResult(

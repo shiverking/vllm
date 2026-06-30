@@ -134,6 +134,7 @@ def summarize(values: list[float]) -> dict[str, float | None]:
 
 def run_one_prefix_streaming_request(
     *,
+    request_id: int | None = None,
     audio_path: Path,
     api_base: str,
     model: str,
@@ -148,6 +149,7 @@ def run_one_prefix_streaming_request(
     stream: bool,
     temperature: float,
     timeout: float,
+    log_rounds: bool,
 ) -> dict[str, Any]:
     request_start = time.perf_counter()
     audio, actual_sample_rate = load_audio(str(audio_path), sr=sample_rate, mono=True)
@@ -178,6 +180,16 @@ def run_one_prefix_streaming_request(
             state.stable_text,
             max_prefix_words,
         )
+        if log_rounds:
+            print(
+                "[round-start] "
+                f"request_id={request_id} file={audio_path.name} "
+                f"round={rounds} "
+                f"window_ms={start / actual_sample_rate * 1000.0:.0f}-"
+                f"{end / actual_sample_rate * 1000.0:.0f} "
+                f"prefix_words={len(prefix.split())}",
+                flush=True,
+            )
         result = prefix_client.post_audio_request(
             api_base=api_base,
             endpoint=endpoint,
@@ -198,6 +210,15 @@ def run_one_prefix_streaming_request(
             round_ttft_ms.append(result.ttft_ms)
             if first_round_ttft_ms is None:
                 first_round_ttft_ms = result.ttft_ms
+        if log_rounds:
+            print(
+                "[round-done] "
+                f"request_id={request_id} file={audio_path.name} "
+                f"round={rounds} latency_ms={result.latency_ms:.0f} "
+                f"ttft_ms={result.ttft_ms if result.ttft_ms is not None else -1:.0f} "
+                f"response_words={len(result.text.split())}",
+                flush=True,
+            )
 
         candidate_text = prefix_client.merge_history_and_candidate(
             state.stable_text,
@@ -219,6 +240,13 @@ def run_one_prefix_streaming_request(
     if max_window_samples is not None:
         final_audio = audio[-max_window_samples:]
 
+    if log_rounds:
+        print(
+            "[final-start] "
+            f"request_id={request_id} file={audio_path.name} "
+            f"prefix_words={len(final_prefix.split())}",
+            flush=True,
+        )
     final_result = prefix_client.post_audio_request(
         api_base=api_base,
         endpoint=endpoint,
@@ -239,6 +267,16 @@ def run_one_prefix_streaming_request(
         round_ttft_ms.append(final_result.ttft_ms)
         if first_round_ttft_ms is None:
             first_round_ttft_ms = final_result.ttft_ms
+    if log_rounds:
+        print(
+            "[final-done] "
+            f"request_id={request_id} file={audio_path.name} "
+            f"latency_ms={final_result.latency_ms:.0f} "
+            "ttft_ms="
+            f"{final_result.ttft_ms if final_result.ttft_ms is not None else -1:.0f} "
+            f"response_words={len(final_result.text.split())}",
+            flush=True,
+        )
 
     state.stable_text = prefix_client.merge_history_and_candidate(
         state.stable_text,
@@ -283,6 +321,7 @@ def run_worker(
     start_event.wait()
     try:
         result = run_one_prefix_streaming_request(
+            request_id=request_id,
             audio_path=audio_path,
             api_base=args.api_base,
             model=args.model,
@@ -297,6 +336,7 @@ def run_worker(
             stream=args.stream,
             temperature=args.temperature,
             timeout=args.timeout,
+            log_rounds=args.log_rounds,
         )
         result["request_id"] = request_id
         return result
@@ -327,6 +367,7 @@ def perform_warmup(args: argparse.Namespace) -> list[float]:
         start = time.perf_counter()
         try:
             result = run_one_prefix_streaming_request(
+                request_id=-(i + 1),
                 audio_path=warmup_path,
                 api_base=args.api_base,
                 model=args.model,
@@ -341,6 +382,7 @@ def perform_warmup(args: argparse.Namespace) -> list[float]:
                 stream=args.stream,
                 temperature=args.temperature,
                 timeout=args.timeout,
+                log_rounds=args.log_rounds,
             )
             times.append(result["e2e_ms"])
             print(
@@ -443,6 +485,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stream", action="store_true")
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--timeout", type=float, default=600.0)
+    parser.add_argument(
+        "--log-rounds",
+        action="store_true",
+        help="Print every pseudo-streaming round for diagnosing stalls.",
+    )
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--num-requests", type=int, default=None)
     parser.add_argument("--output-file", default="prefix_streaming_benchmark.json")
