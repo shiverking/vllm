@@ -18,10 +18,12 @@ positions/attention context.
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import re
 import time
 import unicodedata
+import wave
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -30,13 +32,6 @@ import numpy as np
 import requests
 
 from vllm.multimodal.media.audio import load_audio
-
-try:
-    import openai_prefix_streaming_transcription_client as prefix_client
-except ImportError:
-    from examples.speech_to_text.openai import (
-        openai_prefix_streaming_transcription_client as prefix_client,
-    )
 
 
 @dataclass
@@ -54,6 +49,41 @@ class ProbeTranscription:
 
 def seconds_to_ms(seconds: float) -> float:
     return seconds * 1000.0
+
+
+def audio_to_wav_buffer(audio: np.ndarray, sample_rate: int) -> io.BytesIO:
+    pcm16 = np.clip(audio, -1.0, 1.0)
+    pcm16 = (pcm16 * 32767.0).astype(np.int16)
+
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(pcm16.tobytes())
+
+    buffer.seek(0)
+    buffer.name = "audio.wav"
+    return buffer
+
+
+def build_audio_endpoint_url(api_base: str, endpoint: str) -> str:
+    base = api_base.rstrip("/")
+    if base.endswith("/audio"):
+        return f"{base}/{endpoint}"
+    return f"{base}/audio/{endpoint}"
+
+
+def extract_stream_delta(payload: dict[str, Any]) -> str:
+    choices = payload.get("choices") or []
+    if not choices:
+        return ""
+
+    delta = choices[0].get("delta") or {}
+    content = delta.get("content")
+    if content is None:
+        return ""
+    return content
 
 
 def normalize_text(text: str) -> str:
@@ -196,7 +226,7 @@ def extract_stream_text(response: requests.Response) -> tuple[str, float | None]
         if line.strip() == "[DONE]":
             break
         payload = json.loads(line)
-        delta = prefix_client.extract_stream_delta(payload)
+        delta = extract_stream_delta(payload)
         if delta:
             if ttft_ms is None:
                 ttft_ms = seconds_to_ms(time.perf_counter() - start)
@@ -225,11 +255,11 @@ def post_audio_request(
         data["max_completion_tokens"] = args.max_completion_tokens
 
     request_start = time.perf_counter()
-    with prefix_client.audio_to_wav_buffer(audio, sample_rate) as wav_buffer:
+    with audio_to_wav_buffer(audio, sample_rate) as wav_buffer:
         upload_bytes = wav_buffer.getbuffer().nbytes
         files = {"file": ("audio.wav", wav_buffer, "audio/wav")}
         with requests.post(
-            prefix_client.build_audio_endpoint_url(args.api_base, endpoint),
+            build_audio_endpoint_url(args.api_base, endpoint),
             data=data,
             files=files,
             stream=args.stream,
