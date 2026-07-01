@@ -101,6 +101,53 @@ def content_text(text: str) -> str:
     return "".join(chars)
 
 
+def content_text_with_positions(text: str) -> tuple[str, list[int]]:
+    chars: list[str] = []
+    positions: list[int] = []
+    for idx, original_char in enumerate(text):
+        for char in original_char.casefold():
+            if char.isspace() or unicodedata.category(char)[0] in {"P", "S"}:
+                continue
+            chars.append(char)
+            positions.append(idx)
+    return "".join(chars), positions
+
+
+def merge_text_with_content_overlap(
+    prefix_text: str,
+    continuation_text: str,
+    min_overlap_chars: int,
+) -> tuple[str, int]:
+    """Merge two ASR texts using content-normalized suffix/prefix overlap."""
+    if not prefix_text:
+        return continuation_text, 0
+    if not continuation_text:
+        return prefix_text, 0
+
+    prefix_content, _ = content_text_with_positions(prefix_text)
+    continuation_content, continuation_positions = content_text_with_positions(
+        continuation_text
+    )
+    if not prefix_content or not continuation_content:
+        return f"{prefix_text} {continuation_text}", 0
+
+    if continuation_content.startswith(prefix_content):
+        return continuation_text, len(prefix_content)
+    if prefix_content.endswith(continuation_content):
+        return prefix_text, len(continuation_content)
+
+    max_overlap = min(len(prefix_content), len(continuation_content))
+    for overlap_chars in range(max_overlap, min_overlap_chars - 1, -1):
+        if prefix_content[-overlap_chars:] == continuation_content[:overlap_chars]:
+            continuation_start = continuation_positions[overlap_chars - 1] + 1
+            return (
+                f"{prefix_text} {continuation_text[continuation_start:].lstrip()}",
+                overlap_chars,
+            )
+
+    return f"{prefix_text} {continuation_text}", 0
+
+
 def levenshtein_distance(reference: str, hypothesis: str) -> int:
     if reference == hypothesis:
         return 0
@@ -199,11 +246,55 @@ def analyze_decoder_kv_reuse(
         target["approx_qwen3_asr_audio_tokens"]
         - prefix["approx_qwen3_asr_audio_tokens"]
     )
+    target_audio_tokens = target["approx_qwen3_asr_audio_tokens"]
+    prefix_audio_tokens = prefix["approx_qwen3_asr_audio_tokens"]
     return {
         "prefix_audio": prefix,
         "target_audio": target,
         "inserted_audio_tokens_before_assistant": inserted_audio_tokens,
         "naive_decoder_kv_reuse_safe": inserted_audio_tokens == 0,
+        "candidate_decoder_kv_reuse": {
+            "fixed_text_prompt_kv": {
+                "safe": True,
+                "reason": (
+                    "System/user text before the audio placeholder keeps the "
+                    "same positions and attention context."
+                ),
+            },
+            "prefix_audio_kv": {
+                "safe_if_audio_embeddings_are_stable": True,
+                "approx_tokens": prefix_audio_tokens,
+                "reason": (
+                    "Old audio tokens remain before newly appended audio tokens. "
+                    "This is the main Engine-level prefill-cache candidate, but "
+                    "it depends on the audio encoder producing stable embeddings "
+                    "for the old audio prefix after more audio arrives."
+                ),
+            },
+            "new_audio_kv": {
+                "must_compute": True,
+                "approx_tokens": inserted_audio_tokens,
+                "reason": "New audio chunk tokens were not present in the cache.",
+            },
+            "assistant_transcript_kv": {
+                "safe": inserted_audio_tokens == 0,
+                "reason": (
+                    "Unsafe when audio grows because new audio tokens are inserted "
+                    "before assistant text, changing transcript token positions "
+                    "and attention context."
+                ),
+            },
+        },
+        "approx_prefill_work": {
+            "full_target_audio_tokens": target_audio_tokens,
+            "append_only_audio_tokens_if_prefix_kv_reused": max(
+                0, inserted_audio_tokens
+            ),
+            "audio_token_prefill_saving_ratio": (
+                prefix_audio_tokens / target_audio_tokens
+                if target_audio_tokens > 0 else 0.0
+            ),
+        },
         "verdict": (
             "unsafe: appending audio inserts new audio tokens before assistant "
             "generation, so cached transcript-token KV from the shorter audio "
@@ -326,6 +417,40 @@ def compare_outputs(
     }
 
 
+def make_merged_transcription(
+    *,
+    prefix: ProbeTranscription,
+    continuation: ProbeTranscription,
+    min_overlap_chars: int,
+    repeat_ngram_size: int,
+    repeat_ngram_threshold: int,
+) -> tuple[ProbeTranscription, int]:
+    merged_text, overlap_chars = merge_text_with_content_overlap(
+        prefix.text,
+        continuation.text,
+        min_overlap_chars,
+    )
+    return (
+        ProbeTranscription(
+            name="prefix_plus_text_prefix_decode",
+            text=merged_text,
+            latency_ms=prefix.latency_ms + continuation.latency_ms,
+            ttft_ms=prefix.ttft_ms,
+            audio_start_ms=prefix.audio_start_ms,
+            audio_end_ms=continuation.audio_end_ms,
+            response_words=len(merged_text.split()),
+            response_chars=len(merged_text),
+            repeated=prefix.repeated or continuation.repeated
+            or has_repeated_char_ngram(
+                merged_text,
+                repeat_ngram_size,
+                repeat_ngram_threshold,
+            ),
+        ),
+        overlap_chars,
+    )
+
+
 def print_transcription(result: ProbeTranscription, include_text: bool) -> None:
     print(
         f"[{result.name}] "
@@ -406,6 +531,22 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
                 response_prefix=prefix_result.text,
             )
             results.append(prefixed_result)
+            merged_result, merged_overlap_chars = make_merged_transcription(
+                prefix=prefix_result,
+                continuation=prefixed_result,
+                min_overlap_chars=args.merge_min_overlap_chars,
+                repeat_ngram_size=args.repeat_ngram_size,
+                repeat_ngram_threshold=args.repeat_ngram_threshold,
+            )
+            results.append(merged_result)
+            print(
+                "[merged-response-prefix] "
+                f"overlap_content_chars={merged_overlap_chars} "
+                f"prefix_chars={prefix_result.response_chars} "
+                f"continuation_chars={prefixed_result.response_chars} "
+                f"merged_chars={merged_result.response_chars}",
+                flush=True,
+            )
 
         for result in results:
             print_transcription(result, args.include_text)
@@ -415,8 +556,8 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
         target = results[1]
         comparisons.append(compare_outputs(target, results[0]))
         comparisons.append(compare_outputs(target, results[2]))
-        if len(results) > 3:
-            comparisons.append(compare_outputs(target, results[3]))
+        for result in results[3:]:
+            comparisons.append(compare_outputs(target, result))
         print("[comparisons]")
         print(json.dumps(comparisons, indent=2, ensure_ascii=False))
 
@@ -464,6 +605,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-completion-tokens", type=int, default=512)
     parser.add_argument("--repeat-ngram-size", type=int, default=12)
     parser.add_argument("--repeat-ngram-threshold", type=int, default=8)
+    parser.add_argument(
+        "--merge-min-overlap-chars",
+        type=int,
+        default=16,
+        help=(
+            "Minimum content-normalized character overlap used when merging "
+            "prefix text with response_prefix continuation text."
+        ),
+    )
     parser.add_argument(
         "--probe-response-prefix",
         action="store_true",
