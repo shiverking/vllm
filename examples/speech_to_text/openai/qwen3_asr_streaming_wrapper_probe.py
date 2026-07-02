@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import difflib
 import json
 import os
 import re
@@ -233,10 +234,137 @@ def longest_suffix_prefix_overlap(left: str, right: str) -> int:
     return 0
 
 
-def merge_with_overlap(prefix: str, next_text: str) -> tuple[str, int, str]:
-    overlap = longest_suffix_prefix_overlap(prefix, next_text)
-    delta = next_text[overlap:]
-    return prefix + delta, overlap, delta
+def normalize_char(char: str) -> str:
+    char = unicodedata.normalize("NFKC", char).lower()
+    if not char:
+        return ""
+    if char in string.whitespace:
+        return ""
+    category = unicodedata.category(char[0])
+    if category.startswith("P") or category.startswith("S"):
+        return ""
+    return char
+
+
+def normalize_with_raw_ends(text: str) -> tuple[str, list[int]]:
+    chars: list[str] = []
+    raw_ends: list[int] = []
+    for index, char in enumerate(text):
+        normalized = normalize_char(char)
+        if normalized:
+            chars.append(normalized)
+            raw_ends.append(index + 1)
+    return "".join(chars), raw_ends
+
+
+def raw_end_for_normalized_len(text: str, normalized_len: int) -> int:
+    if normalized_len <= 0:
+        return 0
+    _, raw_ends = normalize_with_raw_ends(text)
+    if not raw_ends:
+        return 0
+    if normalized_len >= len(raw_ends):
+        return len(text)
+    return raw_ends[normalized_len - 1]
+
+
+def sequence_ratio(left: str, right: str) -> float:
+    if not left and not right:
+        return 1.0
+    if not left or not right:
+        return 0.0
+    return difflib.SequenceMatcher(None, left, right).ratio()
+
+
+def find_fuzzy_overlap(
+    left: str,
+    right: str,
+    min_overlap_chars: int,
+    threshold: float,
+) -> tuple[int, int, float]:
+    norm_left, _ = normalize_with_raw_ends(left)
+    norm_right, right_raw_ends = normalize_with_raw_ends(right)
+    max_len = min(len(norm_left), len(norm_right))
+    best_len = 0
+    best_score = 0.0
+    for overlap_len in range(max_len, min_overlap_chars - 1, -1):
+        score = sequence_ratio(
+            norm_left[-overlap_len:],
+            norm_right[:overlap_len],
+        )
+        if score >= threshold:
+            raw_overlap = (
+                right_raw_ends[overlap_len - 1]
+                if overlap_len <= len(right_raw_ends)
+                else len(right)
+            )
+            return raw_overlap, overlap_len, score
+        if score > best_score:
+            best_len = overlap_len
+            best_score = score
+    if best_len > 0 and best_score >= threshold * 0.95:
+        raw_overlap = right_raw_ends[best_len - 1]
+        return raw_overlap, best_len, best_score
+    return 0, 0, best_score
+
+
+def merge_asr_text(
+    current_text: str,
+    new_text: str,
+    cumulative_threshold: float,
+    overlap_threshold: float,
+    min_overlap_chars: int,
+) -> dict[str, Any]:
+    if not current_text:
+        return {
+            "merged_text": new_text,
+            "delta": new_text,
+            "overlap_chars": 0,
+            "overlap_normalized_chars": 0,
+            "overlap_score": 0.0,
+            "merge_mode": "initial",
+            "replaced_chars": 0,
+        }
+
+    norm_current = normalize_content(current_text)
+    norm_new = normalize_content(new_text)
+    prefix_len = min(len(norm_current), len(norm_new))
+    prefix_score = sequence_ratio(
+        norm_current[:prefix_len],
+        norm_new[:prefix_len],
+    )
+    if (
+        prefix_len >= min_overlap_chars
+        and len(norm_new) >= max(prefix_len, int(len(norm_current) * 0.75))
+        and prefix_score >= cumulative_threshold
+    ):
+        raw_overlap = raw_end_for_normalized_len(new_text, prefix_len)
+        return {
+            "merged_text": new_text,
+            "delta": new_text[raw_overlap:],
+            "overlap_chars": raw_overlap,
+            "overlap_normalized_chars": prefix_len,
+            "overlap_score": prefix_score,
+            "merge_mode": "cumulative_replace",
+            "replaced_chars": len(current_text),
+        }
+
+    raw_overlap, norm_overlap, overlap_score = find_fuzzy_overlap(
+        current_text,
+        new_text,
+        min_overlap_chars,
+        overlap_threshold,
+    )
+    delta = new_text[raw_overlap:]
+    return {
+        "merged_text": current_text + delta,
+        "delta": delta,
+        "overlap_chars": raw_overlap,
+        "overlap_normalized_chars": norm_overlap,
+        "overlap_score": overlap_score,
+        "merge_mode": "append_overlap" if raw_overlap else "append_all",
+        "replaced_chars": 0,
+    }
 
 
 def split_holdback(
@@ -300,8 +428,6 @@ def levenshtein_distance(left: str, right: str) -> int:
 
 
 def compare_text(reference: str, hypothesis: str) -> dict[str, Any]:
-    import difflib
-
     ref = normalize_content(reference)
     hyp = normalize_content(hypothesis)
     similarity = difflib.SequenceMatcher(None, ref, hyp).ratio()
@@ -412,10 +538,16 @@ async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
                 sampling_params=sampling_params,
                 request_id=f"{args.request_id}-round-{chunk_index}",
             )
-            new_merged_text, overlap_chars, delta = merge_with_overlap(
+            merge_result = merge_asr_text(
                 merged_text,
                 str(decoded["clean_text"]),
+                args.cumulative_similarity_threshold,
+                args.overlap_similarity_threshold,
+                args.min_overlap_chars,
             )
+            new_merged_text = str(merge_result["merged_text"])
+            delta = str(merge_result["delta"])
+            overlap_chars = int(merge_result["overlap_chars"])
             stable_text, pending_text = split_holdback(
                 new_merged_text,
                 args.holdback_words,
@@ -437,6 +569,12 @@ async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
                 "stable_chars": len(stable_text),
                 "pending_chars": len(pending_text),
                 "duplicate_ratio": duplicate_ratio,
+                "merge_mode": merge_result["merge_mode"],
+                "overlap_score": merge_result["overlap_score"],
+                "overlap_normalized_chars": (
+                    merge_result["overlap_normalized_chars"]
+                ),
+                "replaced_chars": merge_result["replaced_chars"],
                 "latency_ms": decoded["latency_ms"],
                 "ttft_ms": decoded["ttft_ms"],
                 "tokens": decoded["tokens"],
@@ -448,7 +586,9 @@ async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
                 f"ttft_ms={decoded['ttft_ms']} "
                 f"overlap_chars={overlap_chars} delta_chars={len(delta)} "
                 f"merged_chars={len(merged_text)} "
-                f"duplicate_ratio={duplicate_ratio:.3f}",
+                f"duplicate_ratio={duplicate_ratio:.3f} "
+                f"merge_mode={merge_result['merge_mode']} "
+                f"overlap_score={merge_result['overlap_score']:.3f}",
                 flush=True,
             )
             if args.include_text:
@@ -461,6 +601,10 @@ async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
 
     e2e_ms = seconds_to_ms(time.perf_counter() - start_time)
     comparison = compare_text(str(baseline["clean_text"]), merged_text)
+    merge_mode_counts: dict[str, int] = {}
+    for round_result in rounds:
+        merge_mode = str(round_result["merge_mode"])
+        merge_mode_counts[merge_mode] = merge_mode_counts.get(merge_mode, 0) + 1
     summary = {
         "config": vars(args),
         "audio": {
@@ -479,6 +623,7 @@ async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
             "merged_chars": len(merged_text),
             "stable_chars": len(stable_text),
             "pending_chars": len(pending_text),
+            "merge_mode_counts": merge_mode_counts,
             **comparison,
         },
         "merged_text": merged_text if args.include_text else None,
@@ -522,6 +667,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tail-chars", type=int, default=240)
     parser.add_argument("--holdback-words", type=int, default=5)
     parser.add_argument("--holdback-chars", type=int, default=0)
+    parser.add_argument("--cumulative-similarity-threshold", type=float, default=0.8)
+    parser.add_argument("--overlap-similarity-threshold", type=float, default=0.82)
+    parser.add_argument("--min-overlap-chars", type=int, default=20)
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
