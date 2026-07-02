@@ -16,10 +16,18 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import time
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import Any
+
+# Keep this before any vLLM import. This local probe is intended to inspect
+# Engine streaming mechanics, and out-of-tree plugins can fail during import
+# when their patch set does not match the current vLLM checkout.
+_ORIGINAL_VLLM_PLUGINS = os.environ.get("VLLM_PLUGINS")
+if os.environ.get("QWEN3_ASR_ENGINE_PROBE_ENABLE_PLUGINS") != "1":
+    os.environ["VLLM_PLUGINS"] = ""
 
 import numpy as np
 import torch
@@ -111,7 +119,12 @@ def build_realtime_prompt(
 
 
 def make_engine_args(args: argparse.Namespace) -> AsyncEngineArgs:
-    if not args.enable_plugins:
+    if args.enable_plugins:
+        if _ORIGINAL_VLLM_PLUGINS is None:
+            os.environ.pop("VLLM_PLUGINS", None)
+        else:
+            os.environ["VLLM_PLUGINS"] = _ORIGINAL_VLLM_PLUGINS
+    else:
         skip_general_plugins_for_probe()
 
     hf_overrides: dict[str, Any] = {"architectures": ["Qwen3ASRRealtimeGeneration"]}
@@ -157,7 +170,8 @@ async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
     print(
         "[engine] architecture_override=Qwen3ASRRealtimeGeneration "
         "path=AsyncLLM.StreamingInput resumable_request=true "
-        f"general_plugins={'enabled' if args.enable_plugins else 'skipped'}",
+        f"plugins={'enabled' if args.enable_plugins else 'disabled'} "
+        f"vllm_plugins={os.environ.get('VLLM_PLUGINS')!r}",
         flush=True,
     )
 
@@ -315,8 +329,10 @@ def parse_args() -> argparse.Namespace:
         "--enable-plugins",
         action="store_true",
         help=(
-            "Run vLLM general plugins instead of skipping them for this local "
-            "Engine probe."
+            "Use the original plugin configuration instead of disabling "
+            "VLLM_PLUGINS before AsyncEngineArgs initialization. To allow "
+            "plugins during early vLLM imports too, set "
+            "QWEN3_ASR_ENGINE_PROBE_ENABLE_PLUGINS=1 before running."
         ),
     )
     parser.add_argument(
