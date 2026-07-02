@@ -161,6 +161,10 @@ def extract_qwen3_asr_segments(text: str) -> list[dict[str, Any]]:
             {
                 "segment_index": 1,
                 "raw_prefix": "",
+                "raw_start": 0,
+                "raw_end": len(text),
+                "text_start": 0,
+                "text_end": len(text),
                 "raw_text": text,
                 "clean_text": clean_text,
                 "raw_chars": len(text),
@@ -177,6 +181,10 @@ def extract_qwen3_asr_segments(text: str) -> list[dict[str, Any]]:
             {
                 "segment_index": index,
                 "raw_prefix": match.group(0).strip(),
+                "raw_start": match.start(),
+                "raw_end": next_start,
+                "text_start": match.end(),
+                "text_end": next_start,
                 "raw_text": raw_segment,
                 "clean_text": clean_segment,
                 "raw_chars": len(raw_segment),
@@ -184,6 +192,49 @@ def extract_qwen3_asr_segments(text: str) -> list[dict[str, Any]]:
             }
         )
     return segments
+
+
+def add_segment_token_counts(
+    segments: list[dict[str, Any]],
+    output_events: list[dict[str, Any]],
+    max_tokens: int,
+) -> None:
+    if not segments:
+        return
+
+    for segment in segments:
+        segment["generated_tokens"] = 0
+        segment["suspect_max_tokens_truncated"] = False
+
+    cursor = 0
+    segment_idx = 0
+    for event in output_events:
+        raw_text = str(event.get("raw_text") or "")
+        token_count = int(event.get("num_token_ids") or 0)
+        if not raw_text and token_count == 0:
+            continue
+
+        event_start = cursor
+        event_end = cursor + len(raw_text)
+        cursor = event_end
+
+        while (
+            segment_idx + 1 < len(segments)
+            and event_start >= int(segments[segment_idx]["raw_end"])
+        ):
+            segment_idx += 1
+
+        segment = segments[segment_idx]
+        raw_start = int(segment["raw_start"])
+        raw_end = int(segment["raw_end"])
+        if event_end > raw_start and event_start < raw_end:
+            segment["generated_tokens"] += token_count
+
+    for segment in segments:
+        generated_tokens = int(segment["generated_tokens"])
+        segment["suspect_max_tokens_truncated"] = (
+            max_tokens > 0 and generated_tokens >= max_tokens - 1
+        )
 
 
 def longest_suffix_prefix_overlap(left: str, right: str) -> int:
@@ -251,6 +302,22 @@ def make_engine_args(args: argparse.Namespace) -> AsyncEngineArgs:
     )
 
 
+def parse_int_sweep(value: str | None) -> list[int]:
+    if value is None:
+        return []
+
+    sweep: list[int] = []
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        parsed = int(item)
+        if parsed <= 0:
+            raise ValueError("--max-tokens-sweep values must be positive")
+        sweep.append(parsed)
+    return sweep
+
+
 async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
     audio_path = Path(args.audio_path)
     audio, sample_rate = load_audio(str(audio_path), sr=args.sample_rate, mono=True)
@@ -285,6 +352,7 @@ async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
     engine = AsyncLLM.from_engine_args(make_engine_args(args))
     chunk_stats: list[dict[str, Any]] = []
     output_events: list[dict[str, Any]] = []
+    token_events: list[dict[str, Any]] = []
     all_text_parts: list[str] = []
     last_clean_text = ""
     raw_ttft_ms: float | None = None
@@ -365,6 +433,12 @@ async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
                     "num_token_ids": len(token_ids),
                 }
                 output_events.append(event)
+                token_events.append(
+                    {
+                        "raw_text": text,
+                        "num_token_ids": len(token_ids),
+                    }
+                )
                 print(
                     "[output] "
                     f"elapsed_ms={event['elapsed_ms']:.0f} "
@@ -387,9 +461,9 @@ async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
 
     final_raw_text = "".join(all_text_parts)
     final_clean_text = strip_qwen3_asr_protocol_text(final_raw_text)
-    segment_analyses = analyze_segments(
-        extract_qwen3_asr_segments(final_raw_text)
-    )
+    raw_segments = extract_qwen3_asr_segments(final_raw_text)
+    add_segment_token_counts(raw_segments, token_events, args.max_tokens)
+    segment_analyses = analyze_segments(raw_segments)
     merged_text = merge_segments_with_overlap(segment_analyses)
     cumulative_audio_tokens = sum(
         int(chunk["approx_audio_tokens"]) for chunk in chunk_stats
@@ -428,6 +502,10 @@ async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
                 1 for segment in segment_analyses
                 if segment["mostly_repeated"]
             ),
+            "suspect_max_tokens_truncated_segments": sum(
+                1 for segment in segment_analyses
+                if segment["suspect_max_tokens_truncated"]
+            ),
         },
         "cache_probe": {
             "engine_path": "AsyncLLM StreamingInput resumable request",
@@ -457,11 +535,14 @@ async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
             "[segment] "
             f"index={segment['segment_index']} "
             f"clean_chars={segment['clean_chars']} "
+            f"tokens={segment['generated_tokens']} "
             f"overlap_prev={segment['overlap_with_previous_chars']} "
             f"overlap_merged={segment['overlap_with_merged_chars']} "
             f"added_chars={segment['added_chars_after_merge']} "
             f"duplicate_ratio={segment['duplicate_ratio_vs_merged']:.3f} "
-            f"mostly_repeated={segment['mostly_repeated']}",
+            f"mostly_repeated={segment['mostly_repeated']} "
+            "max_tokens_truncated="
+            f"{segment['suspect_max_tokens_truncated']}",
             flush=True,
         )
         if args.include_text:
@@ -502,6 +583,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-chunks", type=int, default=4)
     parser.add_argument("--max-tokens", type=int, default=64)
+    parser.add_argument(
+        "--max-tokens-sweep",
+        default=None,
+        help=(
+            "Comma-separated max_tokens values to run sequentially, e.g. "
+            "'64,128,256'. This helps check whether segment boundaries move "
+            "when generation is allowed to continue longer."
+        ),
+    )
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
@@ -536,7 +626,45 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    summary = asyncio.run(run_probe(args))
+    max_tokens_sweep = parse_int_sweep(args.max_tokens_sweep)
+    if max_tokens_sweep:
+        summaries = []
+        base_request_id = args.request_id
+        for max_tokens in max_tokens_sweep:
+            run_args = argparse.Namespace(**vars(args))
+            run_args.max_tokens = max_tokens
+            run_args.request_id = f"{base_request_id}-max-tokens-{max_tokens}"
+            print(
+                "\n[sweep-start] "
+                f"max_tokens={max_tokens} request_id={run_args.request_id}",
+                flush=True,
+            )
+            summaries.append(asyncio.run(run_probe(run_args)))
+
+        summary = {
+            "config": vars(args),
+            "sweep": {
+                "field": "max_tokens",
+                "values": max_tokens_sweep,
+            },
+            "runs": summaries,
+        }
+        print("[sweep-summary]")
+        for run in summaries:
+            metrics = run["metrics"]
+            print(
+                "[sweep-result] "
+                f"max_tokens={run['config']['max_tokens']} "
+                f"segments={metrics['segments']} "
+                f"merged_chars={metrics['merged_chars']} "
+                "suspect_truncated_segments="
+                f"{metrics['suspect_max_tokens_truncated_segments']} "
+                f"e2e_ms={metrics['e2e_ms']:.0f}",
+                flush=True,
+            )
+    else:
+        summary = asyncio.run(run_probe(args))
+
     with open(args.output_file, "w", encoding="utf-8") as output_file:
         json.dump(summary, output_file, indent=2, ensure_ascii=False)
     print(f"\nResults saved to: {args.output_file}")
