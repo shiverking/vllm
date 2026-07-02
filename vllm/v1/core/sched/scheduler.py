@@ -66,14 +66,30 @@ from vllm.v1.utils import record_function_or_nullcontext
 logger = init_logger(__name__)
 
 _QWEN3_ASR_STREAM_DEBUG = "VLLM_QWEN3_ASR_STREAM_DEBUG"
+_QWEN3_ASR_STREAM_DROP_OUTPUT_TOKENS = (
+    "VLLM_QWEN3_ASR_STREAM_DROP_OUTPUT_TOKENS"
+)
+_QWEN3_ASR_STREAM_VERBOSE_DEBUG = "VLLM_QWEN3_ASR_STREAM_VERBOSE_DEBUG"
 
 
-def _qwen3_asr_stream_debug_enabled() -> bool:
-    return os.environ.get(_QWEN3_ASR_STREAM_DEBUG, "").lower() in (
+def _env_flag_enabled(name: str) -> bool:
+    return os.environ.get(name, "").lower() in (
         "1",
         "true",
         "yes",
     )
+
+
+def _qwen3_asr_stream_debug_enabled() -> bool:
+    return _env_flag_enabled(_QWEN3_ASR_STREAM_DEBUG)
+
+
+def _qwen3_asr_stream_drop_output_tokens_enabled() -> bool:
+    return _env_flag_enabled(_QWEN3_ASR_STREAM_DROP_OUTPUT_TOKENS)
+
+
+def _qwen3_asr_stream_verbose_debug_enabled() -> bool:
+    return _env_flag_enabled(_QWEN3_ASR_STREAM_VERBOSE_DEBUG)
 
 
 def _mm_feature_debug_summary(features: list[Any] | None) -> list[dict[str, Any]]:
@@ -625,7 +641,7 @@ class Scheduler(SchedulerInterface):
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
-            if request.resumable and _qwen3_asr_stream_debug_enabled():
+            if request.resumable and _qwen3_asr_stream_verbose_debug_enabled():
                 logger.info(
                     "[asr-stream-debug] event=schedule_running "
                     "request_id=%s num_scheduled_tokens=%d "
@@ -1287,13 +1303,15 @@ class Scheduler(SchedulerInterface):
         """
 
         debug_enabled = _qwen3_asr_stream_debug_enabled()
+        drop_output_tokens = _qwen3_asr_stream_drop_output_tokens_enabled()
         if debug_enabled:
             logger.info(
                 "[asr-stream-debug] event=session_update_before "
                 "request_id=%s status=%s num_tokens=%d "
                 "num_prompt_tokens=%d num_computed_tokens=%d "
                 "num_output_tokens=%d all_token_ids=%d "
-                "update_prompt_tokens=%d update_mm_features=%s",
+                "update_prompt_tokens=%d drop_output_tokens=%s "
+                "update_mm_features=%s",
                 session.request_id,
                 session.status.name,
                 session.num_tokens,
@@ -1302,16 +1320,23 @@ class Scheduler(SchedulerInterface):
                 len(session.output_token_ids),
                 len(session.all_token_ids),
                 len(update.prompt_token_ids or ()),
+                drop_output_tokens,
                 _mm_feature_debug_summary(update.mm_features),
             )
 
         # Current streaming input behaviour: Keep only computed output tokens
         # (discard final sampled output token).
-        num_computed_tokens = session.num_computed_tokens
-        kept_output_tokens = session._all_token_ids[
-            session.num_prompt_tokens : num_computed_tokens
-        ]
+        original_num_computed_tokens = session.num_computed_tokens
+        if drop_output_tokens:
+            num_computed_tokens = session.num_prompt_tokens
+            kept_output_tokens = []
+        else:
+            num_computed_tokens = original_num_computed_tokens
+            kept_output_tokens = session._all_token_ids[
+                session.num_prompt_tokens : num_computed_tokens
+            ]
         del session._all_token_ids[num_computed_tokens:]
+        session.num_computed_tokens = num_computed_tokens
         session._output_token_ids.clear()
         assert session.prompt_token_ids is not None
         # Extend prompt with kept output tokens.
@@ -1357,14 +1382,16 @@ class Scheduler(SchedulerInterface):
                 "[asr-stream-debug] event=session_update_after "
                 "request_id=%s num_tokens=%d num_prompt_tokens=%d "
                 "num_computed_tokens=%d kept_output_tokens=%d "
-                "new_prompt_tokens=%d num_output_tokens=%d "
-                "all_token_ids=%d max_tokens=%d sampling_max_tokens=%s "
+                "dropped_output_tokens=%d new_prompt_tokens=%d "
+                "num_output_tokens=%d all_token_ids=%d max_tokens=%d "
+                "sampling_max_tokens=%s "
                 "mm_features=%s",
                 session.request_id,
                 session.num_tokens,
                 session.num_prompt_tokens,
                 session.num_computed_tokens,
                 len(kept_output_tokens),
+                original_num_computed_tokens - num_computed_tokens,
                 len(update.prompt_token_ids or ()),
                 len(session.output_token_ids),
                 len(session.all_token_ids),

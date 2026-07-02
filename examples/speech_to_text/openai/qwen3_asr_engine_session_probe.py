@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import re
 import time
 from collections.abc import AsyncGenerator
@@ -50,6 +51,7 @@ _INCOMPLETE_PROTOCOL_PREFIX_RE = re.compile(
     flags=re.IGNORECASE,
 )
 _DEFAULT_REQUEST_ID = "qwen3-asr-engine-session-probe"
+_DROP_OUTPUT_TOKENS_ENV = "VLLM_QWEN3_ASR_STREAM_DROP_OUTPUT_TOKENS"
 
 
 def skip_general_plugins_for_probe() -> None:
@@ -327,6 +329,14 @@ def default_probe_request_id(args: argparse.Namespace, max_tokens: int) -> str:
 
 
 async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
+    if args.drop_output_tokens_on_session_update:
+        os.environ[_DROP_OUTPUT_TOKENS_ENV] = "1"
+    drop_output_tokens = os.environ.get(_DROP_OUTPUT_TOKENS_ENV, "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
     audio_path = Path(args.audio_path)
     audio, sample_rate = load_audio(str(audio_path), sr=args.sample_rate, mono=True)
     chunks = split_audio(audio, sample_rate, args.chunk_seconds, args.max_chunks)
@@ -347,7 +357,8 @@ async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
         f"sample_rate={sample_rate} chunks={len(chunks)} "
         f"chunk_ms={args.chunk_seconds * 1000.0:.0f} "
         f"model={args.model} prompt_mode={args.chunk_prompt_mode} "
-        f"request_id={args.request_id}",
+        f"request_id={args.request_id} "
+        f"drop_output_tokens={drop_output_tokens}",
         flush=True,
     )
     print(
@@ -448,21 +459,22 @@ async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
                         "num_token_ids": len(token_ids),
                     }
                 )
-                print(
-                    "[output] "
-                    f"elapsed_ms={event['elapsed_ms']:.0f} "
-                    f"finished={output.finished} "
-                    f"raw_delta_chars={len(text)} "
-                    f"clean_delta_chars={len(clean_delta)} "
-                    f"delta_tokens={len(token_ids)}",
-                    flush=True,
-                )
-                if args.include_text and text:
-                    print("[output-raw-text]")
-                    print(text)
-                    if clean_delta:
-                        print("[output-clean-text]")
-                        print(clean_delta)
+                if args.log_output_events:
+                    print(
+                        "[output] "
+                        f"elapsed_ms={event['elapsed_ms']:.0f} "
+                        f"finished={output.finished} "
+                        f"raw_delta_chars={len(text)} "
+                        f"clean_delta_chars={len(clean_delta)} "
+                        f"delta_tokens={len(token_ids)}",
+                        flush=True,
+                    )
+                    if args.include_text and text:
+                        print("[output-raw-text]")
+                        print(text)
+                        if clean_delta:
+                            print("[output-clean-text]")
+                            print(clean_delta)
 
         e2e_ms = seconds_to_ms(time.perf_counter() - start_time)
     finally:
@@ -606,6 +618,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--request-id", default=_DEFAULT_REQUEST_ID)
     parser.add_argument("--input-delay-ms", type=float, default=0.0)
+    parser.add_argument(
+        "--drop-output-tokens-on-session-update",
+        action="store_true",
+        help=(
+            "Experimental scheduler mode: do not fold generated transcript "
+            "tokens back into the prompt when appending the next streaming "
+            "input chunk. This sets VLLM_QWEN3_ASR_STREAM_DROP_OUTPUT_TOKENS=1."
+        ),
+    )
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--max-model-len", type=int, default=None)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
@@ -626,6 +647,11 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--include-text", action="store_true")
+    parser.add_argument(
+        "--log-output-events",
+        action="store_true",
+        help="Print per-token output events. Disabled by default to keep logs compact.",
+    )
     parser.add_argument(
         "--output-file",
         default="qwen3_asr_engine_session_probe.json",
