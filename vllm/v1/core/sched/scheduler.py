@@ -69,6 +69,9 @@ _QWEN3_ASR_STREAM_DEBUG = "VLLM_QWEN3_ASR_STREAM_DEBUG"
 _QWEN3_ASR_STREAM_DROP_OUTPUT_TOKENS = (
     "VLLM_QWEN3_ASR_STREAM_DROP_OUTPUT_TOKENS"
 )
+_QWEN3_ASR_STREAM_KEEP_OUTPUT_TAIL_TOKENS = (
+    "VLLM_QWEN3_ASR_STREAM_KEEP_OUTPUT_TAIL_TOKENS"
+)
 _QWEN3_ASR_STREAM_VERBOSE_DEBUG = "VLLM_QWEN3_ASR_STREAM_VERBOSE_DEBUG"
 
 
@@ -86,6 +89,29 @@ def _qwen3_asr_stream_debug_enabled() -> bool:
 
 def _qwen3_asr_stream_drop_output_tokens_enabled() -> bool:
     return _env_flag_enabled(_QWEN3_ASR_STREAM_DROP_OUTPUT_TOKENS)
+
+
+def _qwen3_asr_stream_keep_output_tail_tokens() -> int | None:
+    value = os.environ.get(_QWEN3_ASR_STREAM_KEEP_OUTPUT_TAIL_TOKENS)
+    if value is None or not value.strip():
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        logger.warning(
+            "Ignoring invalid %s=%r; expected a non-negative integer.",
+            _QWEN3_ASR_STREAM_KEEP_OUTPUT_TAIL_TOKENS,
+            value,
+        )
+        return None
+    if parsed < 0:
+        logger.warning(
+            "Ignoring invalid %s=%r; expected a non-negative integer.",
+            _QWEN3_ASR_STREAM_KEEP_OUTPUT_TAIL_TOKENS,
+            value,
+        )
+        return None
+    return parsed
 
 
 def _qwen3_asr_stream_verbose_debug_enabled() -> bool:
@@ -1304,6 +1330,7 @@ class Scheduler(SchedulerInterface):
 
         debug_enabled = _qwen3_asr_stream_debug_enabled()
         drop_output_tokens = _qwen3_asr_stream_drop_output_tokens_enabled()
+        keep_output_tail_tokens = _qwen3_asr_stream_keep_output_tail_tokens()
         if debug_enabled:
             logger.info(
                 "[asr-stream-debug] event=session_update_before "
@@ -1311,7 +1338,7 @@ class Scheduler(SchedulerInterface):
                 "num_prompt_tokens=%d num_computed_tokens=%d "
                 "num_output_tokens=%d all_token_ids=%d "
                 "update_prompt_tokens=%d drop_output_tokens=%s "
-                "update_mm_features=%s",
+                "keep_output_tail_tokens=%s update_mm_features=%s",
                 session.request_id,
                 session.status.name,
                 session.num_tokens,
@@ -1321,13 +1348,26 @@ class Scheduler(SchedulerInterface):
                 len(session.all_token_ids),
                 len(update.prompt_token_ids or ()),
                 drop_output_tokens,
+                keep_output_tail_tokens,
                 _mm_feature_debug_summary(update.mm_features),
             )
 
         # Current streaming input behaviour: Keep only computed output tokens
         # (discard final sampled output token).
         original_num_computed_tokens = session.num_computed_tokens
-        if drop_output_tokens:
+        available_output_tokens = max(
+            0, original_num_computed_tokens - session.num_prompt_tokens
+        )
+        if keep_output_tail_tokens is not None:
+            num_kept_output_tokens = min(
+                keep_output_tail_tokens, available_output_tokens
+            )
+            num_computed_tokens = session.num_prompt_tokens
+            kept_output_tokens = session._all_token_ids[
+                original_num_computed_tokens
+                - num_kept_output_tokens : original_num_computed_tokens
+            ]
+        elif drop_output_tokens:
             num_computed_tokens = session.num_prompt_tokens
             kept_output_tokens = []
         else:
@@ -1378,20 +1418,21 @@ class Scheduler(SchedulerInterface):
         session.status = RequestStatus.WAITING
 
         if debug_enabled:
+            dropped_output_tokens = available_output_tokens - len(kept_output_tokens)
             logger.info(
                 "[asr-stream-debug] event=session_update_after "
                 "request_id=%s num_tokens=%d num_prompt_tokens=%d "
                 "num_computed_tokens=%d kept_output_tokens=%d "
                 "dropped_output_tokens=%d new_prompt_tokens=%d "
                 "num_output_tokens=%d all_token_ids=%d max_tokens=%d "
-                "sampling_max_tokens=%s "
+                "sampling_max_tokens=%s keep_output_tail_tokens=%s "
                 "mm_features=%s",
                 session.request_id,
                 session.num_tokens,
                 session.num_prompt_tokens,
                 session.num_computed_tokens,
                 len(kept_output_tokens),
-                original_num_computed_tokens - num_computed_tokens,
+                dropped_output_tokens,
                 len(update.prompt_token_ids or ()),
                 len(session.output_token_ids),
                 len(session.all_token_ids),
@@ -1401,6 +1442,7 @@ class Scheduler(SchedulerInterface):
                     if session.sampling_params is not None
                     else None
                 ),
+                keep_output_tail_tokens,
                 _mm_feature_debug_summary(session.mm_features),
             )
 

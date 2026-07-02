@@ -52,6 +52,9 @@ _INCOMPLETE_PROTOCOL_PREFIX_RE = re.compile(
 )
 _DEFAULT_REQUEST_ID = "qwen3-asr-engine-session-probe"
 _DROP_OUTPUT_TOKENS_ENV = "VLLM_QWEN3_ASR_STREAM_DROP_OUTPUT_TOKENS"
+_KEEP_OUTPUT_TAIL_TOKENS_ENV = (
+    "VLLM_QWEN3_ASR_STREAM_KEEP_OUTPUT_TAIL_TOKENS"
+)
 
 
 def skip_general_plugins_for_probe() -> None:
@@ -321,6 +324,24 @@ def parse_int_sweep(value: str | None) -> list[int]:
     return sweep
 
 
+def parse_non_negative_int_sweep(value: str | None) -> list[int]:
+    if value is None:
+        return []
+
+    sweep: list[int] = []
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        parsed = int(item)
+        if parsed < 0:
+            raise ValueError(
+                "--keep-output-tail-tokens-sweep values must be non-negative"
+            )
+        sweep.append(parsed)
+    return sweep
+
+
 def default_probe_request_id(args: argparse.Namespace, max_tokens: int) -> str:
     return (
         f"{_DEFAULT_REQUEST_ID}-{args.chunk_prompt_mode}"
@@ -328,14 +349,34 @@ def default_probe_request_id(args: argparse.Namespace, max_tokens: int) -> str:
     )
 
 
-async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
-    if args.drop_output_tokens_on_session_update:
+def env_flag_enabled(name: str) -> bool:
+    return os.environ.get(name, "").lower() in ("1", "true", "yes")
+
+
+def configure_session_update_env(args: argparse.Namespace) -> dict[str, Any]:
+    tail_tokens = args.keep_output_tail_tokens_on_session_update
+    if tail_tokens is not None:
+        os.environ[_KEEP_OUTPUT_TAIL_TOKENS_ENV] = str(tail_tokens)
+        os.environ.pop(_DROP_OUTPUT_TOKENS_ENV, None)
+    elif args.drop_output_tokens_on_session_update:
+        os.environ.pop(_KEEP_OUTPUT_TAIL_TOKENS_ENV, None)
         os.environ[_DROP_OUTPUT_TOKENS_ENV] = "1"
-    drop_output_tokens = os.environ.get(_DROP_OUTPUT_TOKENS_ENV, "").lower() in (
-        "1",
-        "true",
-        "yes",
-    )
+
+    effective_tail = os.environ.get(_KEEP_OUTPUT_TAIL_TOKENS_ENV)
+    parsed_tail = None
+    if effective_tail is not None and effective_tail.strip():
+        try:
+            parsed_tail = int(effective_tail)
+        except ValueError:
+            parsed_tail = None
+    return {
+        "drop_output_tokens": env_flag_enabled(_DROP_OUTPUT_TOKENS_ENV),
+        "keep_output_tail_tokens": parsed_tail,
+    }
+
+
+async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
+    session_update_config = configure_session_update_env(args)
 
     audio_path = Path(args.audio_path)
     audio, sample_rate = load_audio(str(audio_path), sr=args.sample_rate, mono=True)
@@ -358,7 +399,9 @@ async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
         f"chunk_ms={args.chunk_seconds * 1000.0:.0f} "
         f"model={args.model} prompt_mode={args.chunk_prompt_mode} "
         f"request_id={args.request_id} "
-        f"drop_output_tokens={drop_output_tokens}",
+        f"drop_output_tokens={session_update_config['drop_output_tokens']} "
+        "keep_output_tail_tokens="
+        f"{session_update_config['keep_output_tail_tokens']}",
         flush=True,
     )
     print(
@@ -497,6 +540,7 @@ async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
 
     summary = {
         "config": vars(args),
+        "session_update": session_update_config,
         "audio": {
             "path": str(audio_path.resolve()),
             "duration_ms": len(audio) / sample_rate * 1000.0,
@@ -627,6 +671,24 @@ def parse_args() -> argparse.Namespace:
             "input chunk. This sets VLLM_QWEN3_ASR_STREAM_DROP_OUTPUT_TOKENS=1."
         ),
     )
+    parser.add_argument(
+        "--keep-output-tail-tokens-on-session-update",
+        type=int,
+        default=None,
+        help=(
+            "Experimental scheduler mode: fold back only the last N generated "
+            "transcript tokens when appending the next streaming input chunk. "
+            "N=0 is equivalent to dropping all generated transcript tokens."
+        ),
+    )
+    parser.add_argument(
+        "--keep-output-tail-tokens-sweep",
+        default=None,
+        help=(
+            "Comma-separated non-negative tail-token values to run "
+            "sequentially, e.g. '0,8,16,32'."
+        ),
+    )
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--max-model-len", type=int, default=None)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
@@ -656,13 +718,22 @@ def parse_args() -> argparse.Namespace:
         "--output-file",
         default="qwen3_asr_engine_session_probe.json",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if (
+        args.keep_output_tail_tokens_on_session_update is not None
+        and args.keep_output_tail_tokens_on_session_update < 0
+    ):
+        parser.error("--keep-output-tail-tokens-on-session-update must be >= 0")
+    return args
 
 
 def main() -> None:
     args = parse_args()
     max_tokens_sweep = parse_int_sweep(args.max_tokens_sweep)
-    if max_tokens_sweep:
+    tail_tokens_sweep = parse_non_negative_int_sweep(
+        args.keep_output_tail_tokens_sweep
+    )
+    if max_tokens_sweep or tail_tokens_sweep:
         summaries = []
         custom_request_id = args.request_id != _DEFAULT_REQUEST_ID
         base_request_id = (
@@ -670,22 +741,33 @@ def main() -> None:
             if custom_request_id
             else f"{_DEFAULT_REQUEST_ID}-{args.chunk_prompt_mode}"
         )
-        for max_tokens in max_tokens_sweep:
-            run_args = argparse.Namespace(**vars(args))
-            run_args.max_tokens = max_tokens
-            run_args.request_id = f"{base_request_id}-max-tokens-{max_tokens}"
-            print(
-                "\n[sweep-start] "
-                f"max_tokens={max_tokens} request_id={run_args.request_id}",
-                flush=True,
-            )
-            summaries.append(asyncio.run(run_probe(run_args)))
+        max_tokens_values = max_tokens_sweep or [args.max_tokens]
+        tail_tokens_values: list[int | None]
+        tail_tokens_values = tail_tokens_sweep or [
+            args.keep_output_tail_tokens_on_session_update
+        ]
+        for max_tokens in max_tokens_values:
+            for tail_tokens in tail_tokens_values:
+                run_args = argparse.Namespace(**vars(args))
+                run_args.max_tokens = max_tokens
+                run_args.keep_output_tail_tokens_on_session_update = tail_tokens
+                suffix = f"max-tokens-{max_tokens}"
+                if tail_tokens is not None:
+                    suffix += f"-keep-tail-{tail_tokens}"
+                run_args.request_id = f"{base_request_id}-{suffix}"
+                print(
+                    "\n[sweep-start] "
+                    f"max_tokens={max_tokens} keep_tail={tail_tokens} "
+                    f"request_id={run_args.request_id}",
+                    flush=True,
+                )
+                summaries.append(asyncio.run(run_probe(run_args)))
 
         summary = {
             "config": vars(args),
             "sweep": {
-                "field": "max_tokens",
-                "values": max_tokens_sweep,
+                "max_tokens": max_tokens_values,
+                "keep_output_tail_tokens": tail_tokens_values,
             },
             "runs": summaries,
         }
@@ -695,6 +777,8 @@ def main() -> None:
             print(
                 "[sweep-result] "
                 f"max_tokens={run['config']['max_tokens']} "
+                "keep_tail="
+                f"{run['session_update']['keep_output_tail_tokens']} "
                 f"segments={metrics['segments']} "
                 f"merged_chars={metrics['merged_chars']} "
                 "suspect_truncated_segments="
