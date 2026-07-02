@@ -40,6 +40,21 @@ from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.v1.engine.async_llm import AsyncLLM
 
 
+def skip_general_plugins_for_probe() -> None:
+    # This local probe inspects Engine streaming mechanics. Some out-of-tree
+    # general plugins patch unrelated modules and can fail before the probe
+    # starts when plugin and checkout versions drift. Keep platform plugins
+    # untouched, but skip general plugin hooks unless explicitly requested.
+    import vllm.engine.arg_utils as arg_utils
+    import vllm.plugins as plugins
+
+    def load_no_general_plugins() -> None:
+        plugins.plugins_loaded = True
+
+    plugins.load_general_plugins = load_no_general_plugins
+    arg_utils.load_general_plugins = load_no_general_plugins
+
+
 def seconds_to_ms(seconds: float) -> float:
     return seconds * 1000.0
 
@@ -96,6 +111,9 @@ def build_realtime_prompt(
 
 
 def make_engine_args(args: argparse.Namespace) -> AsyncEngineArgs:
+    if not args.enable_plugins:
+        skip_general_plugins_for_probe()
+
     hf_overrides: dict[str, Any] = {"architectures": ["Qwen3ASRRealtimeGeneration"]}
     if args.hf_overrides:
         hf_overrides.update(json.loads(args.hf_overrides))
@@ -138,7 +156,8 @@ async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
     )
     print(
         "[engine] architecture_override=Qwen3ASRRealtimeGeneration "
-        "path=AsyncLLM.StreamingInput resumable_request=true",
+        "path=AsyncLLM.StreamingInput resumable_request=true "
+        f"general_plugins={'enabled' if args.enable_plugins else 'skipped'}",
         flush=True,
     )
 
@@ -292,6 +311,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--enforce-eager", action="store_true")
+    parser.add_argument(
+        "--enable-plugins",
+        action="store_true",
+        help=(
+            "Run vLLM general plugins instead of skipping them for this local "
+            "Engine probe."
+        ),
+    )
     parser.add_argument(
         "--hf-overrides",
         default=None,
