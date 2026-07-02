@@ -1380,6 +1380,8 @@ class Scheduler(SchedulerInterface):
         session._output_token_ids.clear()
         assert session.prompt_token_ids is not None
         # Extend prompt with kept output tokens.
+        if keep_output_tail_tokens is not None:
+            session._all_token_ids.extend(kept_output_tokens)
         session.prompt_token_ids.extend(kept_output_tokens)
 
         if update.mm_features:
@@ -1411,6 +1413,7 @@ class Scheduler(SchedulerInterface):
         # Update block hashes for the new tokens.
         session.update_block_hashes()
         session.num_prompt_tokens = len(session.prompt_token_ids)
+        assert len(session.all_token_ids) == session.num_prompt_tokens
         session.arrival_time = update.arrival_time
         session.sampling_params = update.sampling_params
         if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
