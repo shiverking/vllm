@@ -45,6 +45,10 @@ _PROTOCOL_PREFIX_RE = re.compile(
     rf"(?:^|\s*)language\s+[^<\r\n]{{1,80}}{re.escape(_ASR_TEXT_TAG)}",
     flags=re.IGNORECASE,
 )
+_INCOMPLETE_PROTOCOL_PREFIX_RE = re.compile(
+    r"(?:^|\s*)language(?:\s+[^<\r\n]{0,80})?$",
+    flags=re.IGNORECASE,
+)
 
 
 def skip_general_plugins_for_probe() -> None:
@@ -145,7 +149,85 @@ def strip_qwen3_asr_protocol_text(text: str) -> str:
         return ""
 
     text = _PROTOCOL_PREFIX_RE.sub("", text)
+    text = _INCOMPLETE_PROTOCOL_PREFIX_RE.sub("", text)
     return text.replace(_ASR_TEXT_TAG, "")
+
+
+def extract_qwen3_asr_segments(text: str) -> list[dict[str, Any]]:
+    matches = list(_PROTOCOL_PREFIX_RE.finditer(text))
+    if not matches:
+        clean_text = strip_qwen3_asr_protocol_text(text)
+        return [
+            {
+                "segment_index": 1,
+                "raw_prefix": "",
+                "raw_text": text,
+                "clean_text": clean_text,
+                "raw_chars": len(text),
+                "clean_chars": len(clean_text),
+            }
+        ] if text else []
+
+    segments: list[dict[str, Any]] = []
+    for index, match in enumerate(matches, start=1):
+        next_start = matches[index].start() if index < len(matches) else len(text)
+        raw_segment = text[match.end() : next_start]
+        clean_segment = strip_qwen3_asr_protocol_text(raw_segment)
+        segments.append(
+            {
+                "segment_index": index,
+                "raw_prefix": match.group(0).strip(),
+                "raw_text": raw_segment,
+                "clean_text": clean_segment,
+                "raw_chars": len(raw_segment),
+                "clean_chars": len(clean_segment),
+            }
+        )
+    return segments
+
+
+def longest_suffix_prefix_overlap(left: str, right: str) -> int:
+    max_len = min(len(left), len(right))
+    for overlap_len in range(max_len, 0, -1):
+        if left[-overlap_len:] == right[:overlap_len]:
+            return overlap_len
+    return 0
+
+
+def merge_segments_with_overlap(segments: list[dict[str, Any]]) -> str:
+    merged = ""
+    for segment in segments:
+        text = str(segment["clean_text"])
+        overlap = longest_suffix_prefix_overlap(merged, text)
+        merged += text[overlap:]
+    return merged
+
+
+def analyze_segments(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    analyses: list[dict[str, Any]] = []
+    merged_so_far = ""
+    previous_text = ""
+    for segment in segments:
+        text = str(segment["clean_text"])
+        previous_overlap = longest_suffix_prefix_overlap(previous_text, text)
+        merged_overlap = longest_suffix_prefix_overlap(merged_so_far, text)
+        added_text = text[merged_overlap:]
+        duplicate_ratio = 0.0
+        if text:
+            duplicate_ratio = merged_overlap / len(text)
+
+        analysis = {
+            **segment,
+            "overlap_with_previous_chars": previous_overlap,
+            "overlap_with_merged_chars": merged_overlap,
+            "added_chars_after_merge": len(added_text),
+            "duplicate_ratio_vs_merged": duplicate_ratio,
+            "mostly_repeated": duplicate_ratio >= 0.6 and len(text) > 0,
+        }
+        analyses.append(analysis)
+        merged_so_far += added_text
+        previous_text = text
+    return analyses
 
 
 def make_engine_args(args: argparse.Namespace) -> AsyncEngineArgs:
@@ -305,6 +387,10 @@ async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
 
     final_raw_text = "".join(all_text_parts)
     final_clean_text = strip_qwen3_asr_protocol_text(final_raw_text)
+    segment_analyses = analyze_segments(
+        extract_qwen3_asr_segments(final_raw_text)
+    )
+    merged_text = merge_segments_with_overlap(segment_analyses)
     cumulative_audio_tokens = sum(
         int(chunk["approx_audio_tokens"]) for chunk in chunk_stats
     )
@@ -335,6 +421,13 @@ async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
             "protocol_prefix_count": len(
                 _PROTOCOL_PREFIX_RE.findall(final_raw_text)
             ),
+            "segments": len(segment_analyses),
+            "merged_chars": len(merged_text),
+            "merged_words": len(merged_text.split()),
+            "mostly_repeated_segments": sum(
+                1 for segment in segment_analyses
+                if segment["mostly_repeated"]
+            ),
         },
         "cache_probe": {
             "engine_path": "AsyncLLM StreamingInput resumable request",
@@ -348,6 +441,8 @@ async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
             ),
         },
         "outputs": output_events,
+        "segments": segment_analyses,
+        "merged_text": merged_text if args.include_text else None,
         "final_text": final_clean_text if args.include_text else None,
         "final_raw_text": final_raw_text if args.include_text else None,
     }
@@ -356,11 +451,29 @@ async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
     print(json.dumps(summary["metrics"], indent=2, ensure_ascii=False), flush=True)
     print("[cache-probe]")
     print(json.dumps(summary["cache_probe"], indent=2, ensure_ascii=False), flush=True)
+    print("[segments]")
+    for segment in segment_analyses:
+        print(
+            "[segment] "
+            f"index={segment['segment_index']} "
+            f"clean_chars={segment['clean_chars']} "
+            f"overlap_prev={segment['overlap_with_previous_chars']} "
+            f"overlap_merged={segment['overlap_with_merged_chars']} "
+            f"added_chars={segment['added_chars_after_merge']} "
+            f"duplicate_ratio={segment['duplicate_ratio_vs_merged']:.3f} "
+            f"mostly_repeated={segment['mostly_repeated']}",
+            flush=True,
+        )
+        if args.include_text:
+            print("[segment-clean-text]")
+            print(segment["clean_text"])
     if args.include_text:
         print("[final-raw-text]")
         print(final_raw_text)
         print("[final-clean-text]")
         print(final_clean_text)
+        print("[merged-text]")
+        print(merged_text)
 
     return summary
 
