@@ -49,6 +49,7 @@ _INCOMPLETE_PROTOCOL_PREFIX_RE = re.compile(
     r"(?:^|\s*)language(?:\s+[^<\r\n]{0,80})?$",
     flags=re.IGNORECASE,
 )
+_DEFAULT_REQUEST_ID = "qwen3-asr-engine-session-probe"
 
 
 def skip_general_plugins_for_probe() -> None:
@@ -318,6 +319,13 @@ def parse_int_sweep(value: str | None) -> list[int]:
     return sweep
 
 
+def default_probe_request_id(args: argparse.Namespace, max_tokens: int) -> str:
+    return (
+        f"{_DEFAULT_REQUEST_ID}-{args.chunk_prompt_mode}"
+        f"-max-tokens-{max_tokens}"
+    )
+
+
 async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
     audio_path = Path(args.audio_path)
     audio, sample_rate = load_audio(str(audio_path), sr=args.sample_rate, mono=True)
@@ -338,7 +346,8 @@ async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
         f"audio={audio_path} duration_ms={len(audio) / sample_rate * 1000.0:.0f} "
         f"sample_rate={sample_rate} chunks={len(chunks)} "
         f"chunk_ms={args.chunk_seconds * 1000.0:.0f} "
-        f"model={args.model} prompt_mode={args.chunk_prompt_mode}",
+        f"model={args.model} prompt_mode={args.chunk_prompt_mode} "
+        f"request_id={args.request_id}",
         flush=True,
     )
     print(
@@ -595,7 +604,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--request-id", default="qwen3-asr-engine-session-probe")
+    parser.add_argument("--request-id", default=_DEFAULT_REQUEST_ID)
     parser.add_argument("--input-delay-ms", type=float, default=0.0)
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--max-model-len", type=int, default=None)
@@ -629,7 +638,12 @@ def main() -> None:
     max_tokens_sweep = parse_int_sweep(args.max_tokens_sweep)
     if max_tokens_sweep:
         summaries = []
-        base_request_id = args.request_id
+        custom_request_id = args.request_id != _DEFAULT_REQUEST_ID
+        base_request_id = (
+            args.request_id
+            if custom_request_id
+            else f"{_DEFAULT_REQUEST_ID}-{args.chunk_prompt_mode}"
+        )
         for max_tokens in max_tokens_sweep:
             run_args = argparse.Namespace(**vars(args))
             run_args.max_tokens = max_tokens
@@ -663,6 +677,8 @@ def main() -> None:
                 flush=True,
             )
     else:
+        if args.request_id == _DEFAULT_REQUEST_ID:
+            args.request_id = default_probe_request_id(args, args.max_tokens)
         summary = asyncio.run(run_probe(args))
 
     with open(args.output_file, "w", encoding="utf-8") as output_file:

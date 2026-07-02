@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -63,6 +64,51 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+_QWEN3_ASR_STREAM_DEBUG = "VLLM_QWEN3_ASR_STREAM_DEBUG"
+
+
+def _qwen3_asr_stream_debug_enabled() -> bool:
+    return os.environ.get(_QWEN3_ASR_STREAM_DEBUG, "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _mm_feature_debug_summary(features: list[Any] | None) -> list[dict[str, Any]]:
+    if not features:
+        return []
+
+    summaries: list[dict[str, Any]] = []
+    for feature in features:
+        position = getattr(feature, "mm_position", None)
+        offset = getattr(position, "offset", None)
+        num_embeds = None
+        if position is not None:
+            get_num_embeds = getattr(position, "get_num_embeds", None)
+            if get_num_embeds is not None:
+                num_embeds = get_num_embeds()
+        summaries.append(
+            {
+                "modality": getattr(feature, "modality", None),
+                "offset": offset,
+                "num_embeds": num_embeds,
+            }
+        )
+    return summaries
+
+
+def _kv_cache_blocks_debug_count(blocks: Any) -> int | None:
+    if blocks is None:
+        return None
+    get_block_ids = getattr(blocks, "get_block_ids", None)
+    if get_block_ids is None:
+        return None
+    block_ids = get_block_ids(allow_none=True)
+    if block_ids is None:
+        return 0
+    return sum(len(group) for group in block_ids)
 
 
 class Scheduler(SchedulerInterface):
@@ -579,6 +625,22 @@ class Scheduler(SchedulerInterface):
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
+            if request.resumable and _qwen3_asr_stream_debug_enabled():
+                logger.info(
+                    "[asr-stream-debug] event=schedule_running "
+                    "request_id=%s num_scheduled_tokens=%d "
+                    "num_tokens=%d num_prompt_tokens=%d "
+                    "num_computed_tokens=%d num_output_tokens=%d "
+                    "new_blocks=%s mm_features=%s",
+                    request_id,
+                    num_new_tokens,
+                    request.num_tokens,
+                    request.num_prompt_tokens,
+                    request.num_computed_tokens,
+                    len(request.output_token_ids),
+                    _kv_cache_blocks_debug_count(new_blocks),
+                    _mm_feature_debug_summary(request.mm_features),
+                )
             token_budget -= num_new_tokens
             req_index += 1
 
@@ -978,6 +1040,22 @@ class Scheduler(SchedulerInterface):
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
+                if request.resumable and _qwen3_asr_stream_debug_enabled():
+                    logger.info(
+                        "[asr-stream-debug] event=schedule_waiting "
+                        "request_id=%s num_scheduled_tokens=%d "
+                        "num_tokens=%d num_prompt_tokens=%d "
+                        "num_computed_tokens=%d num_output_tokens=%d "
+                        "new_blocks=%s mm_features=%s",
+                        request_id,
+                        num_new_tokens,
+                        request.num_tokens,
+                        request.num_prompt_tokens,
+                        request.num_computed_tokens,
+                        len(request.output_token_ids),
+                        _kv_cache_blocks_debug_count(new_blocks),
+                        _mm_feature_debug_summary(request.mm_features),
+                    )
                 if pad_spec_decode:
                     scheduled_spec_decode_tokens[request_id] = [
                         -1
@@ -1208,6 +1286,25 @@ class Scheduler(SchedulerInterface):
         Discards the last sampled output token from the prior input chunk.
         """
 
+        debug_enabled = _qwen3_asr_stream_debug_enabled()
+        if debug_enabled:
+            logger.info(
+                "[asr-stream-debug] event=session_update_before "
+                "request_id=%s status=%s num_tokens=%d "
+                "num_prompt_tokens=%d num_computed_tokens=%d "
+                "num_output_tokens=%d all_token_ids=%d "
+                "update_prompt_tokens=%d update_mm_features=%s",
+                session.request_id,
+                session.status.name,
+                session.num_tokens,
+                session.num_prompt_tokens,
+                session.num_computed_tokens,
+                len(session.output_token_ids),
+                len(session.all_token_ids),
+                len(update.prompt_token_ids or ()),
+                _mm_feature_debug_summary(update.mm_features),
+            )
+
         # Current streaming input behaviour: Keep only computed output tokens
         # (discard final sampled output token).
         num_computed_tokens = session.num_computed_tokens
@@ -1222,11 +1319,27 @@ class Scheduler(SchedulerInterface):
 
         if update.mm_features:
             base = session.num_tokens
+            if debug_enabled:
+                logger.info(
+                    "[asr-stream-debug] event=session_update_mm_rebase "
+                    "request_id=%s base=%d features_before=%s",
+                    session.request_id,
+                    base,
+                    _mm_feature_debug_summary(update.mm_features),
+                )
             for mm_feature in update.mm_features:
                 mm_feature.mm_position = replace(
                     mm_feature.mm_position, offset=mm_feature.mm_position.offset + base
                 )
             session.mm_features.extend(update.mm_features)
+            if debug_enabled:
+                logger.info(
+                    "[asr-stream-debug] event=session_update_mm_rebased "
+                    "request_id=%s features_after=%s total_mm_features=%d",
+                    session.request_id,
+                    _mm_feature_debug_summary(update.mm_features),
+                    len(session.mm_features),
+                )
 
         session._all_token_ids.extend(update.prompt_token_ids or ())
         session.prompt_token_ids.extend(update.prompt_token_ids or ())
@@ -1238,6 +1351,31 @@ class Scheduler(SchedulerInterface):
         if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
             self.num_waiting_for_streaming_input -= 1
         session.status = RequestStatus.WAITING
+
+        if debug_enabled:
+            logger.info(
+                "[asr-stream-debug] event=session_update_after "
+                "request_id=%s num_tokens=%d num_prompt_tokens=%d "
+                "num_computed_tokens=%d kept_output_tokens=%d "
+                "new_prompt_tokens=%d num_output_tokens=%d "
+                "all_token_ids=%d max_tokens=%d sampling_max_tokens=%s "
+                "mm_features=%s",
+                session.request_id,
+                session.num_tokens,
+                session.num_prompt_tokens,
+                session.num_computed_tokens,
+                len(kept_output_tokens),
+                len(update.prompt_token_ids or ()),
+                len(session.output_token_ids),
+                len(session.all_token_ids),
+                session.max_tokens,
+                (
+                    session.sampling_params.max_tokens
+                    if session.sampling_params is not None
+                    else None
+                ),
+                _mm_feature_debug_summary(session.mm_features),
+            )
 
         if self.log_stats:
             session.record_event(EngineCoreEventType.QUEUED)
@@ -1862,10 +2000,39 @@ class Scheduler(SchedulerInterface):
             if update is None:
                 # Streaming request finished.
                 return True
+            if _qwen3_asr_stream_debug_enabled():
+                logger.info(
+                    "[asr-stream-debug] event=streaming_update_dequeued "
+                    "request_id=%s queued_update=True "
+                    "num_tokens=%d num_prompt_tokens=%d "
+                    "num_computed_tokens=%d num_output_tokens=%d "
+                    "update_prompt_tokens=%d update_mm_features=%s",
+                    request.request_id,
+                    request.num_tokens,
+                    request.num_prompt_tokens,
+                    request.num_computed_tokens,
+                    len(request.output_token_ids),
+                    len(update.prompt_token_ids or ()),
+                    _mm_feature_debug_summary(update.mm_features),
+                )
             self._update_request_as_session(request, update)
         else:
             request.status = RequestStatus.WAITING_FOR_STREAMING_REQ
             self.num_waiting_for_streaming_input += 1
+            if _qwen3_asr_stream_debug_enabled():
+                logger.info(
+                    "[asr-stream-debug] event=waiting_for_streaming_input "
+                    "request_id=%s queued_update=False "
+                    "num_tokens=%d num_prompt_tokens=%d "
+                    "num_computed_tokens=%d num_output_tokens=%d "
+                    "all_token_ids=%d",
+                    request.request_id,
+                    request.num_tokens,
+                    request.num_prompt_tokens,
+                    request.num_computed_tokens,
+                    len(request.output_token_ids),
+                    len(request.all_token_ids),
+                )
 
         self._enqueue_waiting_request(request)
         return False
@@ -1993,6 +2160,27 @@ class Scheduler(SchedulerInterface):
                 assert existing.streaming_queue is not None, "duplicate request id"
                 # Queue next input chunk (or finished sentinel).
                 existing.streaming_queue.append(update)
+                if existing.resumable and _qwen3_asr_stream_debug_enabled():
+                    logger.info(
+                        "[asr-stream-debug] event=streaming_update_queued "
+                        "request_id=%s status=%s queue_size=%d "
+                        "update_is_sentinel=%s update_prompt_tokens=%s "
+                        "update_mm_features=%s",
+                        existing.request_id,
+                        existing.status.name,
+                        len(existing.streaming_queue),
+                        update is None,
+                        (
+                            len(update.prompt_token_ids or ())
+                            if update is not None
+                            else None
+                        ),
+                        (
+                            _mm_feature_debug_summary(update.mm_features)
+                            if update is not None
+                            else None
+                        ),
+                    )
             elif update is not None:
                 # Commence next input chunk.
                 self._update_request_as_session(existing, update)
