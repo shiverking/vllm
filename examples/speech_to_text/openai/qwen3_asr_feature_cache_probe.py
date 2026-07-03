@@ -20,7 +20,9 @@ from typing import Any
 import numpy as np
 from transformers import AutoProcessor
 
+from vllm.config import ModelConfig
 from vllm.multimodal.media.audio import load_audio
+from vllm.transformers_utils.processor import cached_processor_from_config
 
 
 def qwen3_asr_audio_token_len(input_length: int) -> int:
@@ -64,13 +66,40 @@ def as_numpy(value: Any) -> np.ndarray:
 
 def load_qwen3_asr_feature_extractor(args: argparse.Namespace) -> Any:
     processor_path = args.processor or args.model
-    processor = AutoProcessor.from_pretrained(
-        processor_path,
-        trust_remote_code=args.trust_remote_code,
-    )
+    processor = None
+    load_errors: list[str] = []
+
+    if args.use_vllm_processor:
+        try:
+            model_config = ModelConfig(
+                model=args.model,
+                tokenizer=args.tokenizer or args.model,
+                trust_remote_code=args.trust_remote_code,
+                hf_overrides={
+                    "architectures": ["Qwen3ASRForConditionalGeneration"],
+                },
+            )
+            processor = cached_processor_from_config(model_config)
+        except Exception as exc:
+            load_errors.append(f"vLLM processor load failed: {exc!r}")
+
+    if processor is None:
+        try:
+            processor = AutoProcessor.from_pretrained(
+                processor_path,
+                trust_remote_code=args.trust_remote_code,
+            )
+        except Exception as exc:
+            load_errors.append(f"AutoProcessor load failed: {exc!r}")
+            raise RuntimeError("; ".join(load_errors)) from exc
+
     if not hasattr(processor, "feature_extractor"):
+        detail = "; ".join(load_errors)
+        if detail:
+            detail = f" Previous load errors: {detail}"
         raise TypeError(
-            f"Processor loaded from {processor_path!r} has no feature_extractor"
+            f"Processor loaded from {processor_path!r} has no feature_extractor."
+            f"{detail}"
         )
     return processor.feature_extractor
 
@@ -396,10 +425,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--audio-path", required=True)
     parser.add_argument("--model", default="Qwen3-ASR-1.7B")
     parser.add_argument("--processor", default=None)
+    parser.add_argument("--tokenizer", default=None)
     parser.add_argument("--sample-rate", type=int, default=16000)
     parser.add_argument("--chunk-seconds", type=float, default=5.0)
     parser.add_argument("--max-chunks", type=int, default=4)
     parser.add_argument("--trust-remote-code", action="store_true")
+    parser.add_argument(
+        "--use-vllm-processor",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Load the Qwen3-ASR processor through vLLM ModelConfig first. "
+            "This is needed when AutoProcessor does not expose "
+            "feature_extractor for local Qwen3-ASR checkpoints."
+        ),
+    )
     parser.add_argument("--ignore-boundary-frames", type=int, default=2)
     parser.add_argument("--feature-tolerance", type=float, default=1e-4)
     parser.add_argument(
