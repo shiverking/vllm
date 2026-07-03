@@ -79,6 +79,12 @@ if TYPE_CHECKING:
     VLLM_MAX_AUDIO_CLIP_FILESIZE_MB: int = 25
     VLLM_MAX_AUDIO_DECODE_DURATION_S: int = 600
     VLLM_MAX_AUDIO_PREPROCESS_WORKERS: int = max(1, min(os.cpu_count() or 1, 2))
+    VLLM_QWEN3_ASR_REALTIME_VAD_BACKEND: str = "fixed"
+    VLLM_QWEN3_ASR_REALTIME_VAD_THRESHOLD: float = 0.5
+    VLLM_QWEN3_ASR_REALTIME_VAD_MIN_SPEECH_MS: int = 250
+    VLLM_QWEN3_ASR_REALTIME_VAD_MIN_SILENCE_MS: int = 700
+    VLLM_QWEN3_ASR_REALTIME_VAD_SPEECH_PAD_MS: int = 300
+    VLLM_QWEN3_ASR_REALTIME_MAX_SEGMENT_S: float = 25.0
     VLLM_VIDEO_LOADER_BACKEND: str = "opencv"
     VLLM_MEDIA_CONNECTOR: str = "http"
     VLLM_MM_HASHER_ALGORITHM: str = "blake3"
@@ -953,6 +959,30 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "VLLM_MAX_AUDIO_PREPROCESS_WORKERS",
             str(max(1, min(os.cpu_count() or 1, 2))),
         )
+    ),
+    # Qwen3-ASR realtime audio segmentation. The default preserves the
+    # fixed-duration chunking behavior. Set to "silero" to segment on speech
+    # activity with the optional silero-vad package.
+    "VLLM_QWEN3_ASR_REALTIME_VAD_BACKEND": env_with_choices(
+        "VLLM_QWEN3_ASR_REALTIME_VAD_BACKEND",
+        "fixed",
+        ["fixed", "silero"],
+        case_sensitive=False,
+    ),
+    "VLLM_QWEN3_ASR_REALTIME_VAD_THRESHOLD": lambda: float(
+        os.getenv("VLLM_QWEN3_ASR_REALTIME_VAD_THRESHOLD", "0.5")
+    ),
+    "VLLM_QWEN3_ASR_REALTIME_VAD_MIN_SPEECH_MS": lambda: int(
+        os.getenv("VLLM_QWEN3_ASR_REALTIME_VAD_MIN_SPEECH_MS", "250")
+    ),
+    "VLLM_QWEN3_ASR_REALTIME_VAD_MIN_SILENCE_MS": lambda: int(
+        os.getenv("VLLM_QWEN3_ASR_REALTIME_VAD_MIN_SILENCE_MS", "700")
+    ),
+    "VLLM_QWEN3_ASR_REALTIME_VAD_SPEECH_PAD_MS": lambda: int(
+        os.getenv("VLLM_QWEN3_ASR_REALTIME_VAD_SPEECH_PAD_MS", "300")
+    ),
+    "VLLM_QWEN3_ASR_REALTIME_MAX_SEGMENT_S": lambda: float(
+        os.getenv("VLLM_QWEN3_ASR_REALTIME_MAX_SEGMENT_S", "25.0")
     ),
     # Backend for Video IO — selects the frame-sampling algorithm.
     # - "opencv": uniform sampling.
@@ -2083,6 +2113,12 @@ def compile_factors() -> dict[str, object]:
         "VLLM_MAX_AUDIO_CLIP_FILESIZE_MB",
         "VLLM_MAX_AUDIO_DECODE_DURATION_S",
         "VLLM_MAX_AUDIO_PREPROCESS_WORKERS",
+        "VLLM_QWEN3_ASR_REALTIME_VAD_BACKEND",
+        "VLLM_QWEN3_ASR_REALTIME_VAD_THRESHOLD",
+        "VLLM_QWEN3_ASR_REALTIME_VAD_MIN_SPEECH_MS",
+        "VLLM_QWEN3_ASR_REALTIME_VAD_MIN_SILENCE_MS",
+        "VLLM_QWEN3_ASR_REALTIME_VAD_SPEECH_PAD_MS",
+        "VLLM_QWEN3_ASR_REALTIME_MAX_SEGMENT_S",
         "VLLM_VIDEO_LOADER_BACKEND",
         "VLLM_MEDIA_CONNECTOR",
         "VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME",

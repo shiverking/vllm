@@ -22,11 +22,16 @@ from collections.abc import AsyncGenerator, Mapping
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm.config import ModelConfig, SpeechToTextConfig, VllmConfig
 from vllm.inputs import PromptType, TokensPrompt
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import (
     SupportsRealtime,
+)
+from vllm.multimodal.realtime_vad import (
+    RealtimeVADSegmenter,
+    SileroSpeechDetector,
 )
 from vllm.model_executor.models.qwen3_asr import (
     Qwen3ASRDummyInputsBuilder,
@@ -194,19 +199,53 @@ class Qwen3ASRRealtimeGeneration(Qwen3ASRForConditionalGeneration, SupportsRealt
         sampling_rate = feature_extractor.sampling_rate
         tokenizer = cached_tokenizer_from_config(model_config)
 
-        # Use a small segment size for low-latency streaming.
-        segment_duration_s = 5.0
-        buffer = Qwen3ASRRealtimeBuffer(
-            sampling_rate=sampling_rate,
-            segment_duration_s=segment_duration_s,
-        )
-
         audio_placeholder = cls.get_placeholder_str("audio", 0)
         prompt_template = (
             f"<|im_start|>user\n{audio_placeholder}<|im_end|>\n<|im_start|>assistant\n"
         )
 
         prompt_token_ids = tokenizer.encode(prompt_template)
+
+        vad_backend = envs.VLLM_QWEN3_ASR_REALTIME_VAD_BACKEND.lower()
+        if vad_backend == "silero":
+            detector = SileroSpeechDetector(
+                sampling_rate=sampling_rate,
+                threshold=envs.VLLM_QWEN3_ASR_REALTIME_VAD_THRESHOLD,
+            )
+            segmenter = RealtimeVADSegmenter(
+                detector,
+                sampling_rate=sampling_rate,
+                min_speech_duration_ms=(
+                    envs.VLLM_QWEN3_ASR_REALTIME_VAD_MIN_SPEECH_MS
+                ),
+                min_silence_duration_ms=(
+                    envs.VLLM_QWEN3_ASR_REALTIME_VAD_MIN_SILENCE_MS
+                ),
+                speech_pad_ms=envs.VLLM_QWEN3_ASR_REALTIME_VAD_SPEECH_PAD_MS,
+                max_segment_duration_s=envs.VLLM_QWEN3_ASR_REALTIME_MAX_SEGMENT_S,
+            )
+
+            async for audio_chunk in audio_stream:
+                for segment in segmenter.write_audio(audio_chunk):
+                    yield TokensPrompt(
+                        prompt_token_ids=prompt_token_ids,
+                        multi_modal_data={"audio": segment},
+                    )
+
+            remaining = segmenter.flush()
+            if remaining is not None and len(remaining) > 0:
+                yield TokensPrompt(
+                    prompt_token_ids=prompt_token_ids,
+                    multi_modal_data={"audio": remaining},
+                )
+            return
+
+        # Use a small segment size for low-latency streaming.
+        segment_duration_s = 5.0
+        buffer = Qwen3ASRRealtimeBuffer(
+            sampling_rate=sampling_rate,
+            segment_duration_s=segment_duration_s,
+        )
 
         async for audio_chunk in audio_stream:
             buffer.write_audio(audio_chunk)

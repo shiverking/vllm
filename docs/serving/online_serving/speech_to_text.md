@@ -153,6 +153,23 @@ The Realtime API provides WebSocket-based streaming audio transcription, allowin
 
 Audio must be sent as base64-encoded PCM16 audio at 16kHz sample rate, mono channel.
 
+### Realtime VAD Segmentation
+
+Qwen3-ASR realtime uses fixed-duration audio segments by default. To segment on
+speech activity instead, install the optional Silero VAD package and set:
+
+```bash
+VLLM_QWEN3_ASR_REALTIME_VAD_BACKEND=silero
+```
+
+The following environment variables tune the segmentation behavior:
+
+- `VLLM_QWEN3_ASR_REALTIME_VAD_THRESHOLD` (default: `0.5`)
+- `VLLM_QWEN3_ASR_REALTIME_VAD_MIN_SPEECH_MS` (default: `250`)
+- `VLLM_QWEN3_ASR_REALTIME_VAD_MIN_SILENCE_MS` (default: `700`)
+- `VLLM_QWEN3_ASR_REALTIME_VAD_SPEECH_PAD_MS` (default: `300`)
+- `VLLM_QWEN3_ASR_REALTIME_MAX_SEGMENT_S` (default: `25.0`)
+
 ### Protocol Overview
 
 1. Client connects to `ws://host/v1/realtime`
