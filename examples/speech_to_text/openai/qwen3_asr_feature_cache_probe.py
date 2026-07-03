@@ -58,6 +58,12 @@ def join_audio(chunks: list[np.ndarray]) -> np.ndarray:
     return np.concatenate(chunks)
 
 
+def parse_float_list(value: str) -> list[float]:
+    if not value.strip():
+        return []
+    return [float(item.strip()) for item in value.split(",") if item.strip()]
+
+
 def as_numpy(value: Any) -> np.ndarray:
     if hasattr(value, "detach"):
         return value.detach().cpu().numpy()
@@ -230,6 +236,89 @@ def compare_features(
     return result
 
 
+def get_feature_hop_length(feature_extractor: Any, sample_rate: int) -> int:
+    hop_length = getattr(feature_extractor, "hop_length", None)
+    if hop_length is not None:
+        return int(hop_length)
+    return sample_rate // 100
+
+
+def build_overlap_concat_features(
+    *,
+    feature_extractor: Any,
+    audio: np.ndarray,
+    chunks: list[np.ndarray],
+    sample_rate: int,
+    overlap_seconds: float,
+    chunk_frame_lengths: list[int],
+) -> dict[str, Any]:
+    hop_length = get_feature_hop_length(feature_extractor, sample_rate)
+    overlap_samples = max(0, int(overlap_seconds * sample_rate))
+    cropped_features = []
+    cropped_frame_lengths = []
+    items = []
+    core_start_sample = 0
+
+    for index, chunk in enumerate(chunks, start=1):
+        core_end_sample = core_start_sample + len(chunk)
+        ext_start_sample = max(0, core_start_sample - overlap_samples)
+        ext_end_sample = min(len(audio), core_end_sample + overlap_samples)
+        ext_audio = audio[ext_start_sample:ext_end_sample]
+        ext_result = extract_features(feature_extractor, ext_audio, sample_rate)
+
+        crop_start_frame = round((core_start_sample - ext_start_sample) / hop_length)
+        expected_frames = chunk_frame_lengths[index - 1]
+        crop_end_frame = crop_start_frame + expected_frames
+        ext_features = ext_result["valid_features"]
+        clipped = crop_end_frame > ext_features.shape[-1]
+        cropped = ext_features[
+            :,
+            crop_start_frame : min(crop_end_frame, ext_features.shape[-1]),
+        ]
+
+        cropped_features.append(cropped)
+        cropped_frame_lengths.append(int(cropped.shape[-1]))
+        items.append(
+            {
+                "index": index,
+                "core_audio_start_ms": core_start_sample / sample_rate * 1000,
+                "core_audio_end_ms": core_end_sample / sample_rate * 1000,
+                "extended_audio_start_ms": ext_start_sample / sample_rate * 1000,
+                "extended_audio_end_ms": ext_end_sample / sample_rate * 1000,
+                "extract_ms": ext_result["elapsed_ms"],
+                "extended_valid_frames": ext_result["valid_frames"],
+                "crop_start_frame": crop_start_frame,
+                "expected_core_frames": expected_frames,
+                "cropped_frames": int(cropped.shape[-1]),
+                "crop_clipped": clipped,
+            }
+        )
+        core_start_sample = core_end_sample
+
+    concat_features = (
+        np.concatenate(cropped_features, axis=-1)
+        if cropped_features
+        else np.empty((0, 0), dtype=np.float32)
+    )
+    concat_frames = int(concat_features.shape[-1])
+    return {
+        "overlap_seconds": overlap_seconds,
+        "overlap_ms": overlap_seconds * 1000,
+        "overlap_samples": overlap_samples,
+        "hop_length": hop_length,
+        "items": items,
+        "concat_features": concat_features,
+        "concat_valid_frames": concat_frames,
+        "concat_as_single_audio_tokens": qwen3_asr_audio_token_len(concat_frames),
+        "sum_cropped_audio_tokens": sum(
+            qwen3_asr_audio_token_len(length)
+            for length in cropped_frame_lengths
+        ),
+        "cropped_frame_lengths": cropped_frame_lengths,
+        "stats": feature_stats(concat_features),
+    }
+
+
 def build_trace() -> list[str]:
     return [
         "raw waveform",
@@ -264,7 +353,7 @@ def build_verdict(
         summary = "plausible: concatenated chunk features match full features"
     else:
         summary = (
-            "unsafe: naive chunk feature concatenation differs from full-audio "
+            "unsafe: chunk feature concatenation differs from full-audio "
             "feature extraction"
         )
 
@@ -344,6 +433,44 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
         comparison=comparison,
         tolerance=args.feature_tolerance,
     )
+    overlap_comparisons = []
+    for overlap_seconds in parse_float_list(args.feature_overlap_seconds):
+        overlap_result = build_overlap_concat_features(
+            feature_extractor=feature_extractor,
+            audio=covered_audio,
+            chunks=chunks,
+            sample_rate=sample_rate,
+            overlap_seconds=overlap_seconds,
+            chunk_frame_lengths=chunk_frame_lengths,
+        )
+        overlap_comparison = compare_features(
+            full["valid_features"],
+            overlap_result["concat_features"],
+            overlap_result["cropped_frame_lengths"],
+            args.ignore_boundary_frames,
+        )
+        overlap_verdict = build_verdict(
+            full_frames=int(full["valid_frames"]),
+            concat_frames=int(overlap_result["concat_valid_frames"]),
+            full_audio_tokens=int(full["audio_tokens"]),
+            concat_as_single_audio_tokens=int(
+                overlap_result["concat_as_single_audio_tokens"]
+            ),
+            sum_chunk_audio_tokens=int(overlap_result["sum_cropped_audio_tokens"]),
+            comparison=overlap_comparison,
+            tolerance=args.feature_tolerance,
+        )
+        overlap_comparisons.append(
+            {
+                key: value
+                for key, value in overlap_result.items()
+                if key != "concat_features"
+            }
+            | {
+                "feature_comparison": overlap_comparison,
+                "verdict": overlap_verdict,
+            }
+        )
 
     summary = {
         "config": vars(args),
@@ -379,6 +506,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
             "stats": feature_stats(concat_features),
         },
         "feature_comparison": comparison,
+        "overlap_feature_comparisons": overlap_comparisons,
         "processor_path_trace": build_trace(),
         "verdict": verdict,
     }
@@ -409,6 +537,9 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
     )
     print("[feature-comparison]")
     print(json.dumps(comparison, indent=2, ensure_ascii=False))
+    if overlap_comparisons:
+        print("[overlap-feature-comparisons]")
+        print(json.dumps(overlap_comparisons, indent=2, ensure_ascii=False))
     print("[processor-path-trace]")
     for step in summary["processor_path_trace"]:
         print(f"- {step}")
@@ -441,6 +572,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--ignore-boundary-frames", type=int, default=2)
+    parser.add_argument(
+        "--feature-overlap-seconds",
+        default="0.5,1.0,2.0",
+        help=(
+            "Comma-separated overlap sizes. For each value, the probe extracts "
+            "features from chunk audio plus left/right context, crops the core "
+            "chunk frames, concatenates them, and compares against full audio."
+        ),
+    )
     parser.add_argument("--feature-tolerance", type=float, default=1e-4)
     parser.add_argument(
         "--output-file",
