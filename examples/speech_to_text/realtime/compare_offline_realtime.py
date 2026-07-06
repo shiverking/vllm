@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import time
 import unicodedata
 from dataclasses import dataclass
@@ -34,11 +35,12 @@ class TranscriptionResult:
 def clean_streamed_asr_text(text: str) -> str:
     if not text:
         return ""
-    if text.startswith("language ") and "<asr_text>" not in text:
-        return ""
     if "<asr_text>" in text:
-        return text.rsplit("<asr_text>", 1)[1]
-    return text
+        text = text.rsplit("<asr_text>", 1)[1]
+    elif re.fullmatch(r"language(?:\s+[A-Za-z]+)?", text):
+        return ""
+    text = re.sub(r"(^|\s)language\s+[A-Za-z]+(?=[A-Z])", r"\1", text)
+    return re.sub(r"(^|\s)language(?=\S)", r"\1", text)
 
 
 def audio_to_pcm16_bytes(audio_path: str) -> bytes:
@@ -167,21 +169,29 @@ async def transcribe_realtime(
             )
 
         async def receive_text() -> TranscriptionResult:
-            pieces: list[str] = []
+            raw_pieces: list[str] = []
+            emitted_text = ""
             ttft_s: float | None = None
             while True:
                 response = json.loads(await ws.recv())
                 if response["type"] == "transcription.delta":
                     delta = response["delta"]
-                    pieces.append(delta)
-                    if delta and ttft_s is None:
-                        ttft_s = time.perf_counter() - start_time
-                    if print_deltas:
-                        print(delta, end="", flush=True)
+                    raw_pieces.append(delta)
+                    cleaned_text = clean_streamed_asr_text("".join(raw_pieces))
+                    if cleaned_text.startswith(emitted_text):
+                        cleaned_delta = cleaned_text[len(emitted_text) :]
+                    else:
+                        cleaned_delta = cleaned_text
+                    if cleaned_delta:
+                        if ttft_s is None:
+                            ttft_s = time.perf_counter() - start_time
+                        emitted_text = cleaned_text
+                        if print_deltas:
+                            print(cleaned_delta, end="", flush=True)
                 elif response["type"] == "transcription.done":
                     e2e_s = time.perf_counter() - start_time
                     return TranscriptionResult(
-                        text=str(response["text"]),
+                        text=clean_streamed_asr_text(str(response["text"])),
                         ttft_s=ttft_s if ttft_s is not None else e2e_s,
                         e2e_s=e2e_s,
                     )
@@ -344,7 +354,7 @@ async def compare(args: argparse.Namespace) -> None:
     print("\n=== Realtime chunked ===")
     print(realtime.text)
     print("\n=== Summary ===")
-    print(f"audio_duration_s={audio_duration_s:.3f}")
+    print(f"audio_duration={audio_duration_s * 1000:.3f}ms")
     print(f"transcription_stream_max_completion_tokens={args.max_completion_tokens}")
     print(f"baseline_chars={len(baseline.text)}")
     print(f"realtime_chars={len(realtime.text)}")
@@ -365,11 +375,9 @@ def print_performance(
     audio_duration_s: float,
 ) -> None:
     e2e_rtf = result.e2e_s / audio_duration_s if audio_duration_s else float("inf")
-    print(
-        f"{name}_ttft_s={result.ttft_s:.3f}, "
-        f"{name}_e2e_s={result.e2e_s:.3f}, "
-        f"{name}_rtf={e2e_rtf:.3f}"
-    )
+    print(f"{name}_ttft={result.ttft_s * 1000:.3f}ms")
+    print(f"{name}_e2e={result.e2e_s * 1000:.3f}ms")
+    print(f"{name}_rtf={e2e_rtf:.3f}")
 
 
 def print_metrics(name: str, metrics: dict[str, float | int]) -> None:
@@ -398,7 +406,7 @@ def main() -> None:
     parser.add_argument(
         "--max-completion-tokens",
         type=int,
-        default=256,
+        default=1024,
         help="Maximum tokens for the transcription stream baseline.",
     )
     parser.add_argument("--realtime-pacing", action="store_true")
