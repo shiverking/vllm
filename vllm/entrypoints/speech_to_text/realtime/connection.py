@@ -354,6 +354,11 @@ class RealtimeConnection:
                 if post_process_output is not None:
                     segment_text = post_process_output(segment_text)
                 if segment_text:
+                    logger.info(
+                        "Realtime independent segment %d transcription: %s",
+                        segment_index,
+                        segment_text,
+                    )
                     delta = get_segment_separator(full_text, segment_text)
                     delta += segment_text
                     full_text += delta
