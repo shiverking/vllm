@@ -59,6 +59,7 @@ async def transcribe_stream(
     port: int,
     model: str,
     language: str | None,
+    max_completion_tokens: int,
     print_deltas: bool,
 ) -> TranscriptionResult:
     url = f"http://{host}:{port}/v1/audio/transcriptions"
@@ -67,6 +68,7 @@ async def transcribe_stream(
         "response_format": "json",
         "stream": "true",
         "temperature": "0.0",
+        "max_completion_tokens": str(max_completion_tokens),
     }
     if language:
         data["language"] = language
@@ -309,6 +311,7 @@ async def compare(args: argparse.Namespace) -> None:
         port=args.port,
         model=args.model,
         language=args.language,
+        max_completion_tokens=args.max_completion_tokens,
         print_deltas=args.print_deltas,
     )
     if args.print_deltas:
@@ -342,6 +345,7 @@ async def compare(args: argparse.Namespace) -> None:
     print(realtime.text)
     print("\n=== Summary ===")
     print(f"audio_duration_s={audio_duration_s:.3f}")
+    print(f"transcription_stream_max_completion_tokens={args.max_completion_tokens}")
     print(f"baseline_chars={len(baseline.text)}")
     print(f"realtime_chars={len(realtime.text)}")
     print_performance("transcription_stream_baseline", baseline, audio_duration_s)
@@ -391,6 +395,12 @@ def main() -> None:
         help="Optional language hint for the transcription stream endpoint.",
     )
     parser.add_argument("--chunk-duration-ms", type=int, default=100)
+    parser.add_argument(
+        "--max-completion-tokens",
+        type=int,
+        default=256,
+        help="Maximum tokens for the transcription stream baseline.",
+    )
     parser.add_argument("--realtime-pacing", action="store_true")
     parser.add_argument("--print-deltas", action="store_true")
     parser.add_argument(
