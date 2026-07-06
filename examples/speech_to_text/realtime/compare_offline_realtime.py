@@ -6,7 +6,9 @@ import argparse
 import asyncio
 import json
 import os
+import unicodedata
 from difflib import SequenceMatcher
+from typing import Sequence
 
 import httpx
 import numpy as np
@@ -115,13 +117,109 @@ async def transcribe_realtime(
                     raise RuntimeError(f"Realtime error: {response['error']}")
 
         _, realtime_text = await asyncio.gather(send_audio(), receive_text())
-        return realtime_text
+    return realtime_text
 
 
-def normalized_similarity(left: str, right: str) -> float:
-    left_norm = " ".join(left.split())
-    right_norm = " ".join(right.split())
-    return SequenceMatcher(None, left_norm, right_norm).ratio()
+def normalize_text(
+    text: str,
+    *,
+    ignore_case: bool,
+    strip_marks: bool,
+    remove_punctuation: bool,
+) -> str:
+    text = unicodedata.normalize("NFKC", text)
+    if ignore_case:
+        text = text.casefold()
+
+    chars: list[str] = []
+    for char in text:
+        category = unicodedata.category(char)
+        if strip_marks and category.startswith("M"):
+            continue
+        if remove_punctuation and category.startswith("P"):
+            continue
+        chars.append(char)
+
+    return " ".join("".join(chars).split())
+
+
+def edit_distance(reference: Sequence[str], hypothesis: Sequence[str]) -> int:
+    if not reference:
+        return len(hypothesis)
+    if not hypothesis:
+        return len(reference)
+
+    previous = list(range(len(hypothesis) + 1))
+    for ref_index, ref_item in enumerate(reference, start=1):
+        current = [ref_index]
+        for hyp_index, hyp_item in enumerate(hypothesis, start=1):
+            substitution_cost = 0 if ref_item == hyp_item else 1
+            current.append(
+                min(
+                    previous[hyp_index] + 1,
+                    current[hyp_index - 1] + 1,
+                    previous[hyp_index - 1] + substitution_cost,
+                )
+            )
+        previous = current
+    return previous[-1]
+
+
+def error_rate(reference: Sequence[str], hypothesis: Sequence[str]) -> float:
+    if not reference:
+        return 0.0 if not hypothesis else 1.0
+    return edit_distance(reference, hypothesis) / len(reference)
+
+
+def char_tokens(text: str) -> list[str]:
+    return [char for char in text if not char.isspace()]
+
+
+def word_tokens(text: str) -> list[str]:
+    return text.split()
+
+
+def calculate_metrics(
+    baseline: str,
+    realtime: str,
+    *,
+    ignore_case: bool,
+    strip_marks: bool,
+    remove_punctuation: bool,
+) -> dict[str, float | int]:
+    baseline_norm = normalize_text(
+        baseline,
+        ignore_case=ignore_case,
+        strip_marks=strip_marks,
+        remove_punctuation=remove_punctuation,
+    )
+    realtime_norm = normalize_text(
+        realtime,
+        ignore_case=ignore_case,
+        strip_marks=strip_marks,
+        remove_punctuation=remove_punctuation,
+    )
+
+    baseline_chars = char_tokens(baseline_norm)
+    realtime_chars = char_tokens(realtime_norm)
+    baseline_words = word_tokens(baseline_norm)
+    realtime_words = word_tokens(realtime_norm)
+
+    cer = error_rate(baseline_chars, realtime_chars)
+    wer = error_rate(baseline_words, realtime_words)
+    return {
+        "baseline_normalized_chars": len(baseline_chars),
+        "realtime_normalized_chars": len(realtime_chars),
+        "baseline_normalized_words": len(baseline_words),
+        "realtime_normalized_words": len(realtime_words),
+        "normalized_similarity": SequenceMatcher(
+            None, baseline_norm, realtime_norm
+        ).ratio(),
+        "cer": cer,
+        "cer_similarity": max(0.0, 1.0 - cer),
+        "wer": wer,
+        "wer_similarity": max(0.0, 1.0 - wer),
+    }
 
 
 async def compare(args: argparse.Namespace) -> None:
@@ -154,7 +252,13 @@ async def compare(args: argparse.Namespace) -> None:
     if args.print_deltas:
         print()
 
-    similarity = normalized_similarity(baseline, realtime)
+    metrics = calculate_metrics(
+        baseline,
+        realtime,
+        ignore_case=not args.keep_case,
+        strip_marks=not args.keep_diacritics,
+        remove_punctuation=not args.keep_punctuation,
+    )
     print("\n=== One-shot baseline ===")
     print(baseline)
     print("\n=== Realtime chunked ===")
@@ -162,7 +266,17 @@ async def compare(args: argparse.Namespace) -> None:
     print("\n=== Summary ===")
     print(f"baseline_chars={len(baseline)}")
     print(f"realtime_chars={len(realtime)}")
-    print(f"normalized_similarity={similarity:.4f}")
+    print(
+        "normalization="
+        f"ignore_case={not args.keep_case}, "
+        f"strip_diacritics={not args.keep_diacritics}, "
+        f"remove_punctuation={not args.keep_punctuation}"
+    )
+    for name, value in metrics.items():
+        if isinstance(value, float):
+            print(f"{name}={value:.4f}")
+        else:
+            print(f"{name}={value}")
 
 
 def main() -> None:
@@ -182,6 +296,21 @@ def main() -> None:
     parser.add_argument("--chunk-duration-ms", type=int, default=100)
     parser.add_argument("--realtime-pacing", action="store_true")
     parser.add_argument("--print-deltas", action="store_true")
+    parser.add_argument(
+        "--keep-case",
+        action="store_true",
+        help="Keep case differences when calculating metrics.",
+    )
+    parser.add_argument(
+        "--keep-diacritics",
+        action="store_true",
+        help="Keep combining marks/diacritics when calculating metrics.",
+    )
+    parser.add_argument(
+        "--keep-punctuation",
+        action="store_true",
+        help="Keep punctuation when calculating metrics.",
+    )
     args = parser.parse_args()
     asyncio.run(compare(args))
 
