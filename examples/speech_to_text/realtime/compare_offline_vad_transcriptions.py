@@ -175,34 +175,67 @@ async def transcribe_vad_pipeline(
     max_segment_s: float,
     vad_chunk_duration_ms: int,
     vad_onnx: bool,
+    head_fixed_segment_s: float,
 ) -> PipelineResult:
-    vad_init_start_time = time.perf_counter()
-    detector = SileroSpeechDetector(
-        sampling_rate=SAMPLE_RATE,
-        threshold=threshold,
-        onnx=vad_onnx,
-    )
-    segmenter = RealtimeVADSegmenter(
-        detector,
-        sampling_rate=SAMPLE_RATE,
-        min_speech_duration_ms=min_speech_ms,
-        min_silence_duration_ms=min_silence_ms,
-        speech_pad_ms=speech_pad_ms,
-        max_segment_duration_s=max_segment_s,
-    )
-    vad_init_s = time.perf_counter() - vad_init_start_time
     pipeline_start_time = time.perf_counter()
     queue: asyncio.Queue[AudioSegment | None] = asyncio.Queue(
         maxsize=max(1, concurrency * 2)
     )
     segment_results: list[SegmentResult] = []
+    vad_init_s: float | None = None
     vad_time_s: float | None = None
 
+    def create_segmenter() -> RealtimeVADSegmenter:
+        detector = SileroSpeechDetector(
+            sampling_rate=SAMPLE_RATE,
+            threshold=threshold,
+            onnx=vad_onnx,
+        )
+        return RealtimeVADSegmenter(
+            detector,
+            sampling_rate=SAMPLE_RATE,
+            min_speech_duration_ms=min_speech_ms,
+            min_silence_duration_ms=min_silence_ms,
+            speech_pad_ms=speech_pad_ms,
+            max_segment_duration_s=max_segment_s,
+        )
+
     async def produce_segments() -> None:
-        nonlocal vad_time_s
+        nonlocal vad_init_s, vad_time_s
         chunk_samples = max(1, int(SAMPLE_RATE * vad_chunk_duration_ms / 1000))
         next_index = 1
-        for start in range(0, len(audio), chunk_samples):
+        audio_offset = 0
+        head_samples = int(SAMPLE_RATE * head_fixed_segment_s)
+        if head_samples > 0:
+            head_samples = min(head_samples, len(audio))
+            if head_samples > 0:
+                fixed_head = audio[:head_samples]
+                emit_offset_s = time.perf_counter() - pipeline_start_time
+                print(
+                    f"vad_segment_{next_index}: "
+                    f"{len(fixed_head) / SAMPLE_RATE:.3f}s "
+                    f"({len(fixed_head)} samples), "
+                    f"emit={emit_offset_s * 1000:.3f}ms, fixed_head."
+                )
+                await queue.put(
+                    AudioSegment(next_index, fixed_head, emit_offset_s)
+                )
+                next_index += 1
+                audio_offset = head_samples
+
+        if audio_offset >= len(audio):
+            vad_init_s = 0.0
+            vad_time_s = 0.0
+            for _ in range(concurrency):
+                await queue.put(None)
+            return
+
+        vad_init_start_time = time.perf_counter()
+        segmenter = await asyncio.to_thread(create_segmenter)
+        vad_init_s = time.perf_counter() - vad_init_start_time
+        vad_scan_start_time = time.perf_counter()
+
+        for start in range(audio_offset, len(audio), chunk_samples):
             chunk = audio[start : start + chunk_samples]
             segments = await asyncio.to_thread(segmenter.write_audio, chunk)
             for segment in segments:
@@ -228,7 +261,7 @@ async def transcribe_vad_pipeline(
             )
             await queue.put(AudioSegment(next_index, remaining, emit_offset_s))
 
-        vad_time_s = time.perf_counter() - pipeline_start_time
+        vad_time_s = time.perf_counter() - vad_scan_start_time
         for _ in range(concurrency):
             await queue.put(None)
 
@@ -316,7 +349,7 @@ async def transcribe_vad_pipeline(
             e2e_s=e2e_s,
         ),
         segments=segment_results,
-        vad_init_s=vad_init_s,
+        vad_init_s=vad_init_s if vad_init_s is not None else 0.0,
         vad_time_s=vad_time_s if vad_time_s is not None else e2e_s,
         first_segment_emit_s=segment_results[0].emit_offset_s,
         first_request_start_s=min(
@@ -491,6 +524,7 @@ async def compare(args: argparse.Namespace) -> None:
         max_segment_s=args.vad_max_segment_s,
         vad_chunk_duration_ms=args.vad_chunk_duration_ms,
         vad_onnx=args.vad_onnx,
+        head_fixed_segment_s=args.head_fixed_segment_s,
     )
     vad_transcription = pipeline_result.transcription
     segment_results = pipeline_result.segments
@@ -525,6 +559,7 @@ async def compare(args: argparse.Namespace) -> None:
     print(f"vad_segment_max_tokens={args.segment_max_completion_tokens}")
     print(f"vad_concurrency={args.segment_concurrency}")
     print(f"vad_onnx={args.vad_onnx}")
+    print(f"head_fixed_segment={args.head_fixed_segment_s * 1000:.3f}ms")
 
     print("\n[text]")
     print(f"baseline_chars={len(baseline.text)}")
@@ -593,6 +628,15 @@ def main() -> None:
     parser.add_argument("--vad-max-segment-s", type=float, default=25.0)
     parser.add_argument("--vad-chunk-duration-ms", type=int, default=1000)
     parser.add_argument(
+        "--head-fixed-segment-s",
+        type=float,
+        default=0.0,
+        help=(
+            "If positive, send the first N seconds as a fixed segment before "
+            "running Silero VAD on the remaining audio."
+        ),
+    )
+    parser.add_argument(
         "--vad-onnx",
         action="store_true",
         help="Use Silero VAD ONNXRuntime backend instead of the JIT backend.",
@@ -617,6 +661,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.segment_concurrency <= 0:
         raise ValueError("--segment-concurrency must be positive.")
+    if args.head_fixed_segment_s < 0:
+        raise ValueError("--head-fixed-segment-s must be non-negative.")
     asyncio.run(compare(args))
 
 
