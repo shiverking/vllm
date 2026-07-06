@@ -3,7 +3,7 @@
 
 import asyncio
 import json
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from http import HTTPStatus
 from uuid import uuid4
 
@@ -55,6 +55,25 @@ def get_segment_separator(full_text: str, segment_text: str) -> str:
     if full_text[-1].isspace() or segment_text[0].isspace():
         return ""
     return " "
+
+
+def _post_process_realtime_text(
+    text: str,
+    post_process_output: Callable[[str], str] | None,
+    *,
+    wait_for_asr_text_tag: bool = False,
+) -> str:
+    if not text:
+        return ""
+    if post_process_output is None:
+        return text
+    if (
+        wait_for_asr_text_tag
+        and text.startswith("language ")
+        and "<asr_text>" not in text
+    ):
+        return ""
+    return post_process_output(text)
 
 
 class RealtimeConnection:
@@ -325,6 +344,10 @@ class RealtimeConnection:
                 segment_index += 1
                 request_id = f"rt-{self.connection_id}-{uuid4()}-{segment_index}"
                 segment_text = ""
+                emitted_segment_text = ""
+                post_process_output = getattr(
+                    self.serving.model_cls, "post_process_output", None
+                )
 
                 result_gen = self.serving.engine_client.generate(
                     prompt=engine_input,
@@ -345,24 +368,43 @@ class RealtimeConnection:
 
                         completion_tokens_len += len(output.outputs[0].token_ids)
 
+                        processed_text = _post_process_realtime_text(
+                            segment_text,
+                            post_process_output,
+                            wait_for_asr_text_tag=True,
+                        )
+                        previous_segment_text = emitted_segment_text
+                        emitted_segment_text, delta = merge_transcription_delta(
+                            emitted_segment_text, processed_text
+                        )
+                        if delta:
+                            if not previous_segment_text:
+                                delta = get_segment_separator(full_text, delta) + delta
+                            full_text += delta
+                            await self.send(TranscriptionDelta(delta=delta))
+
                     if not self._is_connected:
                         break
 
-                post_process_output = getattr(
-                    self.serving.model_cls, "post_process_output", None
+                segment_text = _post_process_realtime_text(
+                    segment_text,
+                    post_process_output,
                 )
-                if post_process_output is not None:
-                    segment_text = post_process_output(segment_text)
                 if segment_text:
                     logger.info(
                         "Realtime independent segment %d transcription: %s",
                         segment_index,
                         segment_text,
                     )
-                    delta = get_segment_separator(full_text, segment_text)
-                    delta += segment_text
-                    full_text += delta
-                    await self.send(TranscriptionDelta(delta=delta))
+                    previous_segment_text = emitted_segment_text
+                    emitted_segment_text, delta = merge_transcription_delta(
+                        emitted_segment_text, segment_text
+                    )
+                    if delta:
+                        if not previous_segment_text:
+                            delta = get_segment_separator(full_text, delta) + delta
+                        full_text += delta
+                        await self.send(TranscriptionDelta(delta=delta))
 
                 if not self._is_connected:
                     break

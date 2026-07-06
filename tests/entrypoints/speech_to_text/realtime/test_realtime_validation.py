@@ -14,6 +14,7 @@ from tests.entrypoints.speech_to_text.conftest import add_attention_backend
 from tests.utils import ROCM_ENV_OVERRIDES, ROCM_EXTRA_ARGS, RemoteOpenAIServer
 from vllm.assets.audio import AudioAsset
 from vllm.entrypoints.speech_to_text.realtime.connection import (
+    _post_process_realtime_text,
     merge_transcription_delta,
 )
 from vllm.multimodal.media.audio import load_audio
@@ -61,6 +62,30 @@ def test_merge_transcription_delta_drops_repeated_segments():
     text, delta = merge_transcription_delta(text, repeated_segment)
     assert text == repeated_segment
     assert delta == ""
+
+
+def test_post_process_realtime_text_waits_for_qwen_asr_text_tag():
+    def post_process(text: str) -> str:
+        if "<asr_text>" not in text:
+            return text
+        return text.rsplit("<asr_text>", 1)[1]
+
+    assert (
+        _post_process_realtime_text(
+            "language English",
+            post_process,
+            wait_for_asr_text_tag=True,
+        )
+        == ""
+    )
+    assert (
+        _post_process_realtime_text(
+            "language English<asr_text>Hello",
+            post_process,
+            wait_for_asr_text_tag=True,
+        )
+        == "Hello"
+    )
 
 
 def _get_websocket_url(server: RemoteOpenAIServer) -> str:
