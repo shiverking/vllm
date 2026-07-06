@@ -203,11 +203,8 @@ async def transcribe_segments(
                 )
                 duration_s = len(segment) / SAMPLE_RATE
                 if print_segment_text:
-                    print(
-                        f"offline_vad_segment_{index}_duration="
-                        f"{duration_s * 1000:.3f}ms"
-                    )
-                    print(f"offline_vad_segment_{index}_text={result.text}")
+                    print(f"vad_segment_{index}_duration={duration_s * 1000:.3f}ms")
+                    print(f"vad_segment_{index}_text={result.text}")
                 return SegmentResult(index, duration_s, result)
 
         tasks = [
@@ -318,17 +315,17 @@ def calculate_metrics(
     cer = error_rate(reference_chars, hypothesis_chars)
     wer = error_rate(reference_words, hypothesis_words)
     return {
-        "reference_normalized_chars": len(reference_chars),
-        "hypothesis_normalized_chars": len(hypothesis_chars),
-        "reference_normalized_words": len(reference_words),
-        "hypothesis_normalized_words": len(hypothesis_words),
-        "normalized_similarity": SequenceMatcher(
+        "ref_chars": len(reference_chars),
+        "hyp_chars": len(hypothesis_chars),
+        "ref_words": len(reference_words),
+        "hyp_words": len(hypothesis_words),
+        "similarity": SequenceMatcher(
             None, reference_norm, hypothesis_norm
         ).ratio(),
         "cer": cer,
-        "cer_similarity": max(0.0, 1.0 - cer),
+        "cer_sim": max(0.0, 1.0 - cer),
         "wer": wer,
-        "wer_similarity": max(0.0, 1.0 - wer),
+        "wer_sim": max(0.0, 1.0 - wer),
     }
 
 
@@ -394,7 +391,7 @@ async def compare(args: argparse.Namespace) -> None:
 
     for index, segment in enumerate(segments, start=1):
         print(
-            f"offline_vad_segment_{index}: "
+            f"vad_segment_{index}: "
             f"{len(segment) / SAMPLE_RATE:.3f}s ({len(segment)} samples)."
         )
 
@@ -419,47 +416,47 @@ async def compare(args: argparse.Namespace) -> None:
     )
 
     speech_duration_s = sum(item.duration_s for item in segment_results)
-    total_e2e_s = vad_time_s + vad_transcription.e2e_s
+    vad_result = TranscriptionResult(
+        text=vad_transcription.text,
+        ttft_s=vad_time_s + vad_transcription.ttft_s,
+        e2e_s=vad_time_s + vad_transcription.e2e_s,
+    )
     print("\n=== Transcription Stream Baseline ===")
     print(baseline.text)
     print("\n=== Offline VAD Transcription ===")
     print(vad_transcription.text)
     print("\n=== Summary ===")
+    print("\n[audio]")
     print(f"audio_duration={audio_duration_s * 1000:.3f}ms")
-    print(f"offline_vad_time={vad_time_s * 1000:.3f}ms")
-    print(f"offline_vad_segments={len(segment_results)}")
-    print(f"offline_vad_speech_duration={speech_duration_s * 1000:.3f}ms")
+    print(f"vad_time={vad_time_s * 1000:.3f}ms")
+    print(f"vad_segments={len(segment_results)}")
+    print(f"vad_speech_duration={speech_duration_s * 1000:.3f}ms")
     print(
-        "offline_vad_speech_ratio="
+        "vad_speech_ratio="
         f"{speech_duration_s / audio_duration_s if audio_duration_s else 0.0:.4f}"
     )
-    print(f"transcription_stream_max_completion_tokens={args.max_completion_tokens}")
-    print(
-        "offline_vad_segment_max_completion_tokens="
-        f"{args.segment_max_completion_tokens}"
-    )
-    print(f"offline_vad_segment_concurrency={args.segment_concurrency}")
+
+    print("\n[config]")
+    print(f"baseline_max_tokens={args.max_completion_tokens}")
+    print(f"vad_segment_max_tokens={args.segment_max_completion_tokens}")
+    print(f"vad_concurrency={args.segment_concurrency}")
+
+    print("\n[text]")
     print(f"baseline_chars={len(baseline.text)}")
-    print(f"offline_vad_transcription_chars={len(vad_transcription.text)}")
-    print_performance("transcription_stream_baseline", baseline, audio_duration_s)
-    print_performance(
-        "offline_vad_transcription",
-        vad_transcription,
-        audio_duration_s,
-    )
-    total_result = TranscriptionResult(
-        text=vad_transcription.text,
-        ttft_s=vad_time_s + vad_transcription.ttft_s,
-        e2e_s=total_e2e_s,
-    )
-    print_performance("offline_vad_total", total_result, audio_duration_s)
+    print(f"vad_chars={len(vad_transcription.text)}")
+
+    print("\n[performance]")
+    print_performance("baseline", baseline, audio_duration_s)
+    print_performance("vad", vad_result, audio_duration_s)
+
+    print("\n[quality]")
     print(
         "normalization="
         f"ignore_case={not args.keep_case}, "
         f"strip_diacritics={not args.keep_diacritics}, "
         f"remove_punctuation={not args.keep_punctuation}"
     )
-    print_metrics("offline_vad_transcription", metrics)
+    print_metrics("vad", metrics)
 
 
 def main() -> None:
