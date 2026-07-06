@@ -104,6 +104,8 @@ async def transcribe_stream(
                         continue
                     delta = choices[0].get("delta", {}).get("content", "")
                     if delta:
+                        if ttft_s is None:
+                            ttft_s = time.perf_counter() - start_time
                         raw_pieces.append(delta)
                         cleaned_text = clean_streamed_asr_text("".join(raw_pieces))
                         if cleaned_text.startswith(emitted_text):
@@ -111,8 +113,6 @@ async def transcribe_stream(
                         else:
                             cleaned_delta = cleaned_text
                         if cleaned_delta:
-                            if ttft_s is None:
-                                ttft_s = time.perf_counter() - start_time
                             emitted_text = cleaned_text
                             if print_deltas:
                                 print(cleaned_delta, end="", flush=True)
@@ -180,6 +180,8 @@ async def transcribe_realtime(
                 response = json.loads(await ws.recv())
                 if response["type"] == "transcription.delta":
                     delta = response["delta"]
+                    if delta and first_delta_time is None:
+                        first_delta_time = time.perf_counter()
                     raw_pieces.append(delta)
                     cleaned_text = clean_streamed_asr_text("".join(raw_pieces))
                     if cleaned_text.startswith(emitted_text):
@@ -187,8 +189,6 @@ async def transcribe_realtime(
                     else:
                         cleaned_delta = cleaned_text
                     if cleaned_delta:
-                        if first_delta_time is None:
-                            first_delta_time = time.perf_counter()
                         emitted_text = cleaned_text
                         if print_deltas:
                             print(cleaned_delta, end="", flush=True)

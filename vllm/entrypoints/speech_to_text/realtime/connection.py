@@ -3,6 +3,7 @@
 
 import asyncio
 import json
+import re
 import time
 from collections.abc import AsyncGenerator, Callable
 from http import HTTPStatus
@@ -30,6 +31,10 @@ from .protocol import (
 from .serving import OpenAIServingRealtime
 
 logger = init_logger(__name__)
+
+_REALTIME_LANGUAGE_PREFIX_RE = re.compile(
+    r"^language(?:\s+[A-Za-z]+(?=[A-Z]))?"
+)
 
 
 def merge_transcription_delta(full_text: str, new_text: str) -> tuple[str, str]:
@@ -68,13 +73,17 @@ def _post_process_realtime_text(
         return ""
     if post_process_output is None:
         return text
+    if "<asr_text>" in text:
+        return post_process_output(text)
     if (
         wait_for_asr_text_tag
-        and text.startswith("language ")
-        and "<asr_text>" not in text
+        and text.startswith("language")
+        and len(text) <= len("language English")
     ):
         return ""
-    return post_process_output(text)
+    if text.startswith("language"):
+        return _REALTIME_LANGUAGE_PREFIX_RE.sub("", text, count=1)
+    return text
 
 
 class RealtimeConnection:
@@ -371,6 +380,17 @@ class RealtimeConnection:
                         segment_text, delta = merge_transcription_delta(
                             segment_text, output.outputs[0].text
                         )
+                        if delta and not first_delta_logged:
+                            first_delta_logged = True
+                            first_delta_ms = (
+                                time.perf_counter() - segment_start_time
+                            ) * 1000
+                            logger.info(
+                                "Realtime independent segment %d first "
+                                "raw delta after %.3fms.",
+                                segment_index,
+                                first_delta_ms,
+                            )
 
                         input_stream.put_nowait(list(output.outputs[0].token_ids))
 
@@ -390,17 +410,6 @@ class RealtimeConnection:
                                 delta = get_segment_separator(full_text, delta) + delta
                             full_text += delta
                             await self.send(TranscriptionDelta(delta=delta))
-                            if not first_delta_logged:
-                                first_delta_logged = True
-                                first_delta_ms = (
-                                    time.perf_counter() - segment_start_time
-                                ) * 1000
-                                logger.info(
-                                    "Realtime independent segment %d first "
-                                    "delta after %.3fms.",
-                                    segment_index,
-                                    first_delta_ms,
-                                )
 
                     if not self._is_connected:
                         break
@@ -424,22 +433,11 @@ class RealtimeConnection:
                             delta = get_segment_separator(full_text, delta) + delta
                         full_text += delta
                         await self.send(TranscriptionDelta(delta=delta))
-                        if not first_delta_logged:
-                            first_delta_logged = True
-                            first_delta_ms = (
-                                time.perf_counter() - segment_start_time
-                            ) * 1000
-                            logger.info(
-                                "Realtime independent segment %d first "
-                                "delta after %.3fms.",
-                                segment_index,
-                                first_delta_ms,
-                            )
 
                 segment_done_ms = (time.perf_counter() - segment_start_time) * 1000
                 logger.info(
                     "Realtime independent segment %d done after %.3fms "
-                    "(first_delta=%s).",
+                    "(first_raw_delta=%s).",
                     segment_index,
                     segment_done_ms,
                     first_delta_logged,
