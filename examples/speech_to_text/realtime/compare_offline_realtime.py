@@ -148,10 +148,12 @@ async def transcribe_realtime(
             raise RuntimeError(f"Unexpected realtime response: {response}")
 
         await ws.send(json.dumps({"type": "session.update", "model": model}))
-        start_time = time.perf_counter()
         await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+        timing_start_time: float | None = None
+        timing_started = asyncio.Event()
 
         async def send_audio() -> None:
+            nonlocal timing_start_time
             for i in range(0, len(audio_bytes), chunk_size):
                 chunk = audio_bytes[i : i + chunk_size]
                 await ws.send(
@@ -167,11 +169,13 @@ async def transcribe_realtime(
             await ws.send(
                 json.dumps({"type": "input_audio_buffer.commit", "final": True})
             )
+            timing_start_time = time.perf_counter()
+            timing_started.set()
 
         async def receive_text() -> TranscriptionResult:
             raw_pieces: list[str] = []
             emitted_text = ""
-            ttft_s: float | None = None
+            first_delta_time: float | None = None
             while True:
                 response = json.loads(await ws.recv())
                 if response["type"] == "transcription.delta":
@@ -183,16 +187,23 @@ async def transcribe_realtime(
                     else:
                         cleaned_delta = cleaned_text
                     if cleaned_delta:
-                        if ttft_s is None:
-                            ttft_s = time.perf_counter() - start_time
+                        if first_delta_time is None:
+                            first_delta_time = time.perf_counter()
                         emitted_text = cleaned_text
                         if print_deltas:
                             print(cleaned_delta, end="", flush=True)
                 elif response["type"] == "transcription.done":
-                    e2e_s = time.perf_counter() - start_time
+                    done_time = time.perf_counter()
+                    await timing_started.wait()
+                    assert timing_start_time is not None
+                    e2e_s = max(0.0, done_time - timing_start_time)
+                    if first_delta_time is None:
+                        ttft_s = e2e_s
+                    else:
+                        ttft_s = max(0.0, first_delta_time - timing_start_time)
                     return TranscriptionResult(
                         text=clean_streamed_asr_text(str(response["text"])),
-                        ttft_s=ttft_s if ttft_s is not None else e2e_s,
+                        ttft_s=ttft_s,
                         e2e_s=e2e_s,
                     )
                 elif response["type"] == "error":
@@ -356,6 +367,7 @@ async def compare(args: argparse.Namespace) -> None:
     print("\n=== Summary ===")
     print(f"audio_duration={audio_duration_s * 1000:.3f}ms")
     print(f"transcription_stream_max_completion_tokens={args.max_completion_tokens}")
+    print("realtime_timing_origin=audio_send_done")
     print(f"baseline_chars={len(baseline.text)}")
     print(f"realtime_chars={len(realtime.text)}")
     print_performance("transcription_stream_baseline", baseline, audio_duration_s)
