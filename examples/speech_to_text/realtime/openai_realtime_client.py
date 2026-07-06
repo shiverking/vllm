@@ -56,6 +56,7 @@ async def realtime_transcribe(
     chunk_duration_ms: int,
     realtime_pacing: bool,
     print_timestamps: bool,
+    print_usage: bool,
 ):
     """
     Connect to the Realtime API and transcribe an audio file.
@@ -125,7 +126,7 @@ async def realtime_transcribe(
                     print(response["delta"], end="", flush=True)
                 elif response["type"] == "transcription.done":
                     print(f"\n\nFinal transcription: {response['text']}")
-                    if response.get("usage"):
+                    if print_usage and response.get("usage"):
                         print(f"Usage: {response['usage']}")
                     break
                 elif response["type"] == "error":
@@ -152,6 +153,7 @@ def main(args):
             args.chunk_duration_ms,
             args.realtime_pacing,
             args.print_timestamps,
+            args.print_usage,
         )
     )
 
@@ -199,6 +201,11 @@ if __name__ == "__main__":
         "--print-timestamps",
         action="store_true",
         help="Print elapsed time before each transcription delta.",
+    )
+    parser.add_argument(
+        "--print-usage",
+        action="store_true",
+        help="Print final token usage returned by the server.",
     )
     args = parser.parse_args()
     main(args)

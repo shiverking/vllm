@@ -12,7 +12,7 @@ from vllm.engine.protocol import EngineClient, StreamingInput
 from vllm.entrypoints.openai.engine.serving import OpenAIServing
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
-from vllm.inputs import PromptType
+from vllm.inputs import EngineInput, PromptType
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsRealtime
 from vllm.renderers.inputs.preprocess import parse_model_prompt
@@ -52,6 +52,10 @@ class OpenAIServingRealtime(OpenAIServing):
         model_cls = get_model_cls(self.model_config)
         return cast(type[SupportsRealtime], model_cls)
 
+    @property
+    def use_streaming_input(self) -> bool:
+        return getattr(self.model_cls, "realtime_use_streaming_input", True)
+
     async def transcribe_realtime(
         self,
         audio_stream: AsyncGenerator[np.ndarray, None],
@@ -69,20 +73,29 @@ class OpenAIServingRealtime(OpenAIServing):
         Yields:
             StreamingInput objects containing audio prompts for the engine
         """
+        async for engine_input in self.transcribe_realtime_engine_inputs(
+            audio_stream, input_stream
+        ):
+            yield StreamingInput(prompt=engine_input)
+
+    async def transcribe_realtime_engine_inputs(
+        self,
+        audio_stream: AsyncGenerator[np.ndarray, None],
+        input_stream: asyncio.Queue[list[int]],
+    ) -> AsyncGenerator[EngineInput, None]:
         model_config = self.model_config
         renderer = self.renderer
 
         # mypy is being stupid
         # TODO(Patrick) - fix this
-        stream_input_iter = cast(
+        prompt_iter = cast(
             AsyncGenerator[PromptType, None],
             self.model_cls.buffer_realtime_audio(
                 audio_stream, input_stream, model_config
             ),
         )
 
-        async for prompt in stream_input_iter:
+        async for prompt in prompt_iter:
             parsed_prompt = parse_model_prompt(model_config, prompt)
             (engine_input,) = await renderer.render_cmpl_async([parsed_prompt])
-
-            yield StreamingInput(prompt=engine_input)
+            yield engine_input

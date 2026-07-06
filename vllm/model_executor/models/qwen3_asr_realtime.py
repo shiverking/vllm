@@ -183,6 +183,7 @@ class Qwen3ASRRealtimeMultiModalProcessor(Qwen3ASRMultiModalProcessor):
 )
 class Qwen3ASRRealtimeGeneration(Qwen3ASRForConditionalGeneration, SupportsRealtime):
     realtime_max_tokens = 64
+    realtime_use_streaming_input = False
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
@@ -208,6 +209,16 @@ class Qwen3ASRRealtimeGeneration(Qwen3ASRForConditionalGeneration, SupportsRealt
 
         vad_backend = envs.VLLM_QWEN3_ASR_REALTIME_VAD_BACKEND.lower()
         if vad_backend == "silero":
+            logger.info(
+                "Qwen3-ASR realtime using Silero VAD segmentation "
+                "(threshold=%.2f, min_speech_ms=%d, min_silence_ms=%d, "
+                "speech_pad_ms=%d, max_segment_s=%.2f).",
+                envs.VLLM_QWEN3_ASR_REALTIME_VAD_THRESHOLD,
+                envs.VLLM_QWEN3_ASR_REALTIME_VAD_MIN_SPEECH_MS,
+                envs.VLLM_QWEN3_ASR_REALTIME_VAD_MIN_SILENCE_MS,
+                envs.VLLM_QWEN3_ASR_REALTIME_VAD_SPEECH_PAD_MS,
+                envs.VLLM_QWEN3_ASR_REALTIME_MAX_SEGMENT_S,
+            )
             detector = SileroSpeechDetector(
                 sampling_rate=sampling_rate,
                 threshold=envs.VLLM_QWEN3_ASR_REALTIME_VAD_THRESHOLD,
@@ -225,8 +236,18 @@ class Qwen3ASRRealtimeGeneration(Qwen3ASRForConditionalGeneration, SupportsRealt
                 max_segment_duration_s=envs.VLLM_QWEN3_ASR_REALTIME_MAX_SEGMENT_S,
             )
 
+            segment_index = 0
             async for audio_chunk in audio_stream:
                 for segment in segmenter.write_audio(audio_chunk):
+                    segment_index += 1
+                    duration_s = len(segment) / sampling_rate
+                    logger.info(
+                        "Qwen3-ASR realtime Silero segment %d: %.3fs "
+                        "(%d samples).",
+                        segment_index,
+                        duration_s,
+                        len(segment),
+                    )
                     yield TokensPrompt(
                         prompt_token_ids=prompt_token_ids,
                         multi_modal_data={"audio": segment},
@@ -234,6 +255,15 @@ class Qwen3ASRRealtimeGeneration(Qwen3ASRForConditionalGeneration, SupportsRealt
 
             remaining = segmenter.flush()
             if remaining is not None and len(remaining) > 0:
+                segment_index += 1
+                duration_s = len(remaining) / sampling_rate
+                logger.info(
+                    "Qwen3-ASR realtime Silero final segment %d: %.3fs "
+                    "(%d samples).",
+                    segment_index,
+                    duration_s,
+                    len(remaining),
+                )
                 yield TokensPrompt(
                     prompt_token_ids=prompt_token_ids,
                     multi_modal_data={"audio": remaining},
@@ -242,6 +272,12 @@ class Qwen3ASRRealtimeGeneration(Qwen3ASRForConditionalGeneration, SupportsRealt
 
         # Use a small segment size for low-latency streaming.
         segment_duration_s = 5.0
+        logger.info(
+            "Qwen3-ASR realtime using fixed %.2fs segmentation "
+            "(VLLM_QWEN3_ASR_REALTIME_VAD_BACKEND=%r).",
+            segment_duration_s,
+            vad_backend,
+        )
         buffer = Qwen3ASRRealtimeBuffer(
             sampling_rate=sampling_rate,
             segment_duration_s=segment_duration_s,

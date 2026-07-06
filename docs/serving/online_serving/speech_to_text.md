@@ -167,7 +167,7 @@ The following environment variables tune the segmentation behavior:
 - `VLLM_QWEN3_ASR_REALTIME_VAD_THRESHOLD` (default: `0.5`)
 - `VLLM_QWEN3_ASR_REALTIME_VAD_MIN_SPEECH_MS` (default: `250`)
 - `VLLM_QWEN3_ASR_REALTIME_VAD_MIN_SILENCE_MS` (default: `700`)
-- `VLLM_QWEN3_ASR_REALTIME_VAD_SPEECH_PAD_MS` (default: `300`)
+- `VLLM_QWEN3_ASR_REALTIME_VAD_SPEECH_PAD_MS` (default: `0`)
 - `VLLM_QWEN3_ASR_REALTIME_MAX_SEGMENT_S` (default: `25.0`)
 
 ### Protocol Overview

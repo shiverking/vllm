@@ -195,16 +195,23 @@ class RealtimeConnection:
         # Create audio stream generator
         audio_stream = self.audio_stream_generator()
         input_stream = asyncio.Queue[list[int]]()
+        if self.serving.use_streaming_input:
+            # Transform to StreamingInput generator
+            streaming_input_gen = self.serving.transcribe_realtime(
+                audio_stream, input_stream
+            )
 
-        # Transform to StreamingInput generator
-        streaming_input_gen = self.serving.transcribe_realtime(
-            audio_stream, input_stream
-        )
-
-        # Start generation task
-        self.generation_task = asyncio.create_task(
-            self._run_generation(streaming_input_gen, input_stream)
-        )
+            # Start generation task
+            self.generation_task = asyncio.create_task(
+                self._run_generation(streaming_input_gen, input_stream)
+            )
+        else:
+            engine_input_gen = self.serving.transcribe_realtime_engine_inputs(
+                audio_stream, input_stream
+            )
+            self.generation_task = asyncio.create_task(
+                self._run_independent_generation(engine_input_gen, input_stream)
+            )
 
     async def _run_generation(
         self,
@@ -283,6 +290,74 @@ class RealtimeConnection:
 
         except Exception as e:
             logger.exception("Error in generation: %s", e)
+            await self.send_error(sanitize_message(str(e)), "processing_error")
+
+    async def _run_independent_generation(
+        self,
+        engine_input_gen: AsyncGenerator,
+        input_stream: asyncio.Queue[list[int]],
+    ):
+        """Run each realtime audio segment as an independent engine request."""
+        full_text = ""
+        prompt_token_ids_len: int = 0
+        completion_tokens_len: int = 0
+        segment_index = 0
+
+        try:
+            from vllm.sampling_params import RequestOutputKind, SamplingParams
+
+            sampling_params = SamplingParams.from_optional(
+                temperature=0.0,
+                max_tokens=self.serving.model_cls.realtime_max_tokens,
+                output_kind=RequestOutputKind.DELTA,
+                skip_clone=True,
+            )
+
+            async for engine_input in engine_input_gen:
+                segment_index += 1
+                request_id = f"rt-{self.connection_id}-{uuid4()}-{segment_index}"
+                segment_text = ""
+
+                result_gen = self.serving.engine_client.generate(
+                    prompt=engine_input,
+                    sampling_params=sampling_params,
+                    request_id=request_id,
+                )
+
+                async for output in result_gen:
+                    if output.outputs and len(output.outputs) > 0:
+                        if not segment_text and output.prompt_token_ids:
+                            prompt_token_ids_len += len(output.prompt_token_ids)
+
+                        segment_text, delta = merge_transcription_delta(
+                            segment_text, output.outputs[0].text
+                        )
+
+                        input_stream.put_nowait(list(output.outputs[0].token_ids))
+                        if delta:
+                            full_text += delta
+                            await self.send(TranscriptionDelta(delta=delta))
+
+                        completion_tokens_len += len(output.outputs[0].token_ids)
+
+                    if not self._is_connected:
+                        break
+
+                if not self._is_connected:
+                    break
+
+            usage = UsageInfo(
+                prompt_tokens=prompt_token_ids_len,
+                completion_tokens=completion_tokens_len,
+                total_tokens=prompt_token_ids_len + completion_tokens_len,
+            )
+            await self.send(TranscriptionDone(text=full_text, usage=usage))
+
+            while not self.audio_queue.empty():
+                self.audio_queue.get_nowait()
+
+        except Exception as e:
+            logger.exception("Error in independent generation: %s", e)
             await self.send_error(sanitize_message(str(e)), "processing_error")
 
     async def send(
