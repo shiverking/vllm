@@ -3,6 +3,7 @@
 
 import asyncio
 import json
+import time
 from collections.abc import AsyncGenerator, Callable
 from http import HTTPStatus
 from uuid import uuid4
@@ -345,10 +346,17 @@ class RealtimeConnection:
                 request_id = f"rt-{self.connection_id}-{uuid4()}-{segment_index}"
                 segment_text = ""
                 emitted_segment_text = ""
+                segment_start_time = time.perf_counter()
+                first_delta_logged = False
                 post_process_output = getattr(
                     self.serving.model_cls, "post_process_output", None
                 )
 
+                logger.info(
+                    "Realtime independent segment %d request started: %s",
+                    segment_index,
+                    request_id,
+                )
                 result_gen = self.serving.engine_client.generate(
                     prompt=engine_input,
                     sampling_params=sampling_params,
@@ -382,6 +390,17 @@ class RealtimeConnection:
                                 delta = get_segment_separator(full_text, delta) + delta
                             full_text += delta
                             await self.send(TranscriptionDelta(delta=delta))
+                            if not first_delta_logged:
+                                first_delta_logged = True
+                                first_delta_ms = (
+                                    time.perf_counter() - segment_start_time
+                                ) * 1000
+                                logger.info(
+                                    "Realtime independent segment %d first "
+                                    "delta after %.3fms.",
+                                    segment_index,
+                                    first_delta_ms,
+                                )
 
                     if not self._is_connected:
                         break
@@ -405,6 +424,26 @@ class RealtimeConnection:
                             delta = get_segment_separator(full_text, delta) + delta
                         full_text += delta
                         await self.send(TranscriptionDelta(delta=delta))
+                        if not first_delta_logged:
+                            first_delta_logged = True
+                            first_delta_ms = (
+                                time.perf_counter() - segment_start_time
+                            ) * 1000
+                            logger.info(
+                                "Realtime independent segment %d first "
+                                "delta after %.3fms.",
+                                segment_index,
+                                first_delta_ms,
+                            )
+
+                segment_done_ms = (time.perf_counter() - segment_start_time) * 1000
+                logger.info(
+                    "Realtime independent segment %d done after %.3fms "
+                    "(first_delta=%s).",
+                    segment_index,
+                    segment_done_ms,
+                    first_delta_logged,
+                )
 
                 if not self._is_connected:
                     break
