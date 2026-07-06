@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Compare one-shot transcription with realtime chunked transcription."""
+"""Compare streaming transcription with realtime chunked transcription."""
 
 import argparse
 import asyncio
 import json
 import os
+import time
 import unicodedata
+from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Sequence
 
@@ -22,29 +24,56 @@ SAMPLE_RATE = 16000
 BYTES_PER_SAMPLE = 2
 
 
+@dataclass
+class TranscriptionResult:
+    text: str
+    ttft_s: float
+    e2e_s: float
+
+
+def clean_streamed_asr_text(text: str) -> str:
+    if not text:
+        return ""
+    if text.startswith("language ") and "<asr_text>" not in text:
+        return ""
+    if "<asr_text>" in text:
+        return text.rsplit("<asr_text>", 1)[1]
+    return text
+
+
 def audio_to_pcm16_bytes(audio_path: str) -> bytes:
     audio, _ = load_audio(audio_path, sr=SAMPLE_RATE, mono=True)
     pcm16 = (audio * 32767).astype(np.int16)
     return pcm16.tobytes()
 
 
-async def transcribe_once(
+def get_audio_duration_s(audio_path: str) -> float:
+    audio, _ = load_audio(audio_path, sr=SAMPLE_RATE, mono=True)
+    return len(audio) / SAMPLE_RATE
+
+
+async def transcribe_stream(
     audio_path: str,
     *,
     host: str,
     port: int,
     model: str,
     language: str | None,
-) -> str:
+    print_deltas: bool,
+) -> TranscriptionResult:
     url = f"http://{host}:{port}/v1/audio/transcriptions"
     data = {
         "model": model,
         "response_format": "json",
+        "stream": "true",
         "temperature": "0.0",
     }
     if language:
         data["language"] = language
 
+    raw_pieces: list[str] = []
+    emitted_text = ""
+    ttft_s: float | None = None
     async with httpx.AsyncClient(timeout=None) as client:
         with open(audio_path, "rb") as audio_file:
             files = {
@@ -54,10 +83,42 @@ async def transcribe_once(
                     "application/octet-stream",
                 )
             }
-            response = await client.post(url, data=data, files=files)
-            response.raise_for_status()
-    payload = response.json()
-    return str(payload.get("text", ""))
+            start_time = time.perf_counter()
+            async with client.stream("POST", url, data=data, files=files) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line or not line.startswith("data: "):
+                        continue
+                    data_line = line[len("data: ") :]
+                    if data_line == "[DONE]":
+                        break
+                    payload = json.loads(data_line)
+                    if "error" in payload:
+                        raise RuntimeError(f"Transcription stream error: {payload}")
+                    choices = payload.get("choices", [])
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta", {}).get("content", "")
+                    if delta:
+                        raw_pieces.append(delta)
+                        cleaned_text = clean_streamed_asr_text("".join(raw_pieces))
+                        if cleaned_text.startswith(emitted_text):
+                            cleaned_delta = cleaned_text[len(emitted_text) :]
+                        else:
+                            cleaned_delta = cleaned_text
+                        if cleaned_delta:
+                            if ttft_s is None:
+                                ttft_s = time.perf_counter() - start_time
+                            emitted_text = cleaned_text
+                            if print_deltas:
+                                print(cleaned_delta, end="", flush=True)
+            e2e_s = time.perf_counter() - start_time
+
+    return TranscriptionResult(
+        text=clean_streamed_asr_text("".join(raw_pieces)),
+        ttft_s=ttft_s if ttft_s is not None else e2e_s,
+        e2e_s=e2e_s,
+    )
 
 
 async def transcribe_realtime(
@@ -69,7 +130,7 @@ async def transcribe_realtime(
     chunk_duration_ms: int,
     realtime_pacing: bool,
     print_deltas: bool,
-) -> str:
+) -> TranscriptionResult:
     uri = f"ws://{host}:{port}/v1/realtime"
     audio_bytes = audio_to_pcm16_bytes(audio_path)
     chunk_size = max(
@@ -83,6 +144,7 @@ async def transcribe_realtime(
             raise RuntimeError(f"Unexpected realtime response: {response}")
 
         await ws.send(json.dumps({"type": "session.update", "model": model}))
+        start_time = time.perf_counter()
         await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
 
         async def send_audio() -> None:
@@ -102,17 +164,25 @@ async def transcribe_realtime(
                 json.dumps({"type": "input_audio_buffer.commit", "final": True})
             )
 
-        async def receive_text() -> str:
+        async def receive_text() -> TranscriptionResult:
             pieces: list[str] = []
+            ttft_s: float | None = None
             while True:
                 response = json.loads(await ws.recv())
                 if response["type"] == "transcription.delta":
                     delta = response["delta"]
                     pieces.append(delta)
+                    if delta and ttft_s is None:
+                        ttft_s = time.perf_counter() - start_time
                     if print_deltas:
                         print(delta, end="", flush=True)
                 elif response["type"] == "transcription.done":
-                    return str(response["text"])
+                    e2e_s = time.perf_counter() - start_time
+                    return TranscriptionResult(
+                        text=str(response["text"]),
+                        ttft_s=ttft_s if ttft_s is not None else e2e_s,
+                        e2e_s=e2e_s,
+                    )
                 elif response["type"] == "error":
                     raise RuntimeError(f"Realtime error: {response['error']}")
 
@@ -180,40 +250,40 @@ def word_tokens(text: str) -> list[str]:
 
 
 def calculate_metrics(
-    baseline: str,
-    realtime: str,
+    reference: str,
+    hypothesis: str,
     *,
     ignore_case: bool,
     strip_marks: bool,
     remove_punctuation: bool,
 ) -> dict[str, float | int]:
-    baseline_norm = normalize_text(
-        baseline,
+    reference_norm = normalize_text(
+        reference,
         ignore_case=ignore_case,
         strip_marks=strip_marks,
         remove_punctuation=remove_punctuation,
     )
-    realtime_norm = normalize_text(
-        realtime,
+    hypothesis_norm = normalize_text(
+        hypothesis,
         ignore_case=ignore_case,
         strip_marks=strip_marks,
         remove_punctuation=remove_punctuation,
     )
 
-    baseline_chars = char_tokens(baseline_norm)
-    realtime_chars = char_tokens(realtime_norm)
-    baseline_words = word_tokens(baseline_norm)
-    realtime_words = word_tokens(realtime_norm)
+    reference_chars = char_tokens(reference_norm)
+    hypothesis_chars = char_tokens(hypothesis_norm)
+    reference_words = word_tokens(reference_norm)
+    hypothesis_words = word_tokens(hypothesis_norm)
 
-    cer = error_rate(baseline_chars, realtime_chars)
-    wer = error_rate(baseline_words, realtime_words)
+    cer = error_rate(reference_chars, hypothesis_chars)
+    wer = error_rate(reference_words, hypothesis_words)
     return {
-        "baseline_normalized_chars": len(baseline_chars),
-        "realtime_normalized_chars": len(realtime_chars),
-        "baseline_normalized_words": len(baseline_words),
-        "realtime_normalized_words": len(realtime_words),
+        "reference_normalized_chars": len(reference_chars),
+        "hypothesis_normalized_chars": len(hypothesis_chars),
+        "reference_normalized_words": len(reference_words),
+        "hypothesis_normalized_words": len(hypothesis_words),
         "normalized_similarity": SequenceMatcher(
-            None, baseline_norm, realtime_norm
+            None, reference_norm, hypothesis_norm
         ).ratio(),
         "cer": cer,
         "cer_similarity": max(0.0, 1.0 - cer),
@@ -228,14 +298,21 @@ async def compare(args: argparse.Namespace) -> None:
         audio_path = str(AudioAsset("mary_had_lamb").get_local_path())
         print(f"No audio path provided, using default: {audio_path}")
 
-    print("Running one-shot transcription baseline...")
-    baseline = await transcribe_once(
+    audio_duration_s = get_audio_duration_s(audio_path)
+
+    print("Running /v1/audio/transcriptions stream=true baseline...")
+    if args.print_deltas:
+        print("Transcription stream baseline deltas: ", end="", flush=True)
+    baseline = await transcribe_stream(
         audio_path,
         host=args.host,
         port=args.port,
         model=args.model,
         language=args.language,
+        print_deltas=args.print_deltas,
     )
+    if args.print_deltas:
+        print()
 
     print("Running realtime chunked transcription...")
     if args.print_deltas:
@@ -252,36 +329,56 @@ async def compare(args: argparse.Namespace) -> None:
     if args.print_deltas:
         print()
 
-    metrics = calculate_metrics(
-        baseline,
-        realtime,
+    realtime_metrics = calculate_metrics(
+        baseline.text,
+        realtime.text,
         ignore_case=not args.keep_case,
         strip_marks=not args.keep_diacritics,
         remove_punctuation=not args.keep_punctuation,
     )
-    print("\n=== One-shot baseline ===")
-    print(baseline)
+    print("\n=== Transcription Stream Baseline ===")
+    print(baseline.text)
     print("\n=== Realtime chunked ===")
-    print(realtime)
+    print(realtime.text)
     print("\n=== Summary ===")
-    print(f"baseline_chars={len(baseline)}")
-    print(f"realtime_chars={len(realtime)}")
+    print(f"audio_duration_s={audio_duration_s:.3f}")
+    print(f"baseline_chars={len(baseline.text)}")
+    print(f"realtime_chars={len(realtime.text)}")
+    print_performance("transcription_stream_baseline", baseline, audio_duration_s)
+    print_performance("realtime", realtime, audio_duration_s)
     print(
         "normalization="
         f"ignore_case={not args.keep_case}, "
         f"strip_diacritics={not args.keep_diacritics}, "
         f"remove_punctuation={not args.keep_punctuation}"
     )
-    for name, value in metrics.items():
+    print_metrics("realtime", realtime_metrics)
+
+
+def print_performance(
+    name: str,
+    result: TranscriptionResult,
+    audio_duration_s: float,
+) -> None:
+    e2e_rtf = result.e2e_s / audio_duration_s if audio_duration_s else float("inf")
+    print(
+        f"{name}_ttft_s={result.ttft_s:.3f}, "
+        f"{name}_e2e_s={result.e2e_s:.3f}, "
+        f"{name}_rtf={e2e_rtf:.3f}"
+    )
+
+
+def print_metrics(name: str, metrics: dict[str, float | int]) -> None:
+    for metric_name, value in metrics.items():
         if isinstance(value, float):
-            print(f"{name}={value:.4f}")
+            print(f"{name}_{metric_name}={value:.4f}")
         else:
-            print(f"{name}={value}")
+            print(f"{name}_{metric_name}={value}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Compare one-shot and realtime ASR outputs."
+        description="Compare transcription stream and realtime ASR outputs."
     )
     parser.add_argument("--audio_path", type=str, default=None)
     parser.add_argument("--host", type=str, default="localhost")
@@ -291,7 +388,7 @@ def main() -> None:
         "--language",
         type=str,
         default=None,
-        help="Optional language hint for the one-shot transcription endpoint.",
+        help="Optional language hint for the transcription stream endpoint.",
     )
     parser.add_argument("--chunk-duration-ms", type=int, default=100)
     parser.add_argument("--realtime-pacing", action="store_true")
