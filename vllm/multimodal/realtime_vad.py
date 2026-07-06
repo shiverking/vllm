@@ -17,7 +17,7 @@ class SpeechDetector(Protocol):
 
 
 @cache
-def _load_silero_vad_model():
+def _load_silero_vad_model(onnx: bool):
     try:
         from silero_vad import load_silero_vad
     except ImportError as exc:
@@ -27,7 +27,7 @@ def _load_silero_vad_model():
             "VLLM_QWEN3_ASR_REALTIME_VAD_BACKEND=silero."
         ) from exc
 
-    return load_silero_vad()
+    return load_silero_vad(onnx=onnx)
 
 
 class SileroSpeechDetector:
@@ -37,6 +37,7 @@ class SileroSpeechDetector:
         *,
         sampling_rate: int,
         threshold: float,
+        onnx: bool = False,
     ) -> None:
         if sampling_rate not in (8000, 16000):
             raise ValueError(
@@ -46,7 +47,7 @@ class SileroSpeechDetector:
         self._sampling_rate = sampling_rate
         self._threshold = threshold
         self._frame_size = 256 if sampling_rate == 8000 else 512
-        self._model = _load_silero_vad_model()
+        self._model = _load_silero_vad_model(onnx)
 
     @property
     def frame_size(self) -> int:

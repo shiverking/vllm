@@ -211,8 +211,9 @@ class Qwen3ASRRealtimeGeneration(Qwen3ASRForConditionalGeneration, SupportsRealt
         if vad_backend == "silero":
             logger.info(
                 "Qwen3-ASR realtime using Silero VAD segmentation "
-                "(threshold=%.2f, min_speech_ms=%d, min_silence_ms=%d, "
-                "speech_pad_ms=%d, max_segment_s=%.2f).",
+                "(onnx=%s, threshold=%.2f, min_speech_ms=%d, "
+                "min_silence_ms=%d, speech_pad_ms=%d, max_segment_s=%.2f).",
+                envs.VLLM_QWEN3_ASR_REALTIME_VAD_ONNX,
                 envs.VLLM_QWEN3_ASR_REALTIME_VAD_THRESHOLD,
                 envs.VLLM_QWEN3_ASR_REALTIME_VAD_MIN_SPEECH_MS,
                 envs.VLLM_QWEN3_ASR_REALTIME_VAD_MIN_SILENCE_MS,
@@ -222,6 +223,7 @@ class Qwen3ASRRealtimeGeneration(Qwen3ASRForConditionalGeneration, SupportsRealt
             detector = SileroSpeechDetector(
                 sampling_rate=sampling_rate,
                 threshold=envs.VLLM_QWEN3_ASR_REALTIME_VAD_THRESHOLD,
+                onnx=envs.VLLM_QWEN3_ASR_REALTIME_VAD_ONNX,
             )
             segmenter = RealtimeVADSegmenter(
                 detector,

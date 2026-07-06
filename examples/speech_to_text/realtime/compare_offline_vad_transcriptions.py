@@ -174,11 +174,13 @@ async def transcribe_vad_pipeline(
     speech_pad_ms: int,
     max_segment_s: float,
     vad_chunk_duration_ms: int,
+    vad_onnx: bool,
 ) -> PipelineResult:
     vad_init_start_time = time.perf_counter()
     detector = SileroSpeechDetector(
         sampling_rate=SAMPLE_RATE,
         threshold=threshold,
+        onnx=vad_onnx,
     )
     segmenter = RealtimeVADSegmenter(
         detector,
@@ -488,6 +490,7 @@ async def compare(args: argparse.Namespace) -> None:
         speech_pad_ms=args.vad_speech_pad_ms,
         max_segment_s=args.vad_max_segment_s,
         vad_chunk_duration_ms=args.vad_chunk_duration_ms,
+        vad_onnx=args.vad_onnx,
     )
     vad_transcription = pipeline_result.transcription
     segment_results = pipeline_result.segments
@@ -521,6 +524,7 @@ async def compare(args: argparse.Namespace) -> None:
     print(f"baseline_max_tokens={args.max_completion_tokens}")
     print(f"vad_segment_max_tokens={args.segment_max_completion_tokens}")
     print(f"vad_concurrency={args.segment_concurrency}")
+    print(f"vad_onnx={args.vad_onnx}")
 
     print("\n[text]")
     print(f"baseline_chars={len(baseline.text)}")
@@ -588,6 +592,11 @@ def main() -> None:
     parser.add_argument("--vad-speech-pad-ms", type=int, default=300)
     parser.add_argument("--vad-max-segment-s", type=float, default=25.0)
     parser.add_argument("--vad-chunk-duration-ms", type=int, default=1000)
+    parser.add_argument(
+        "--vad-onnx",
+        action="store_true",
+        help="Use Silero VAD ONNXRuntime backend instead of the JIT backend.",
+    )
     parser.add_argument("--print-deltas", action="store_true")
     parser.add_argument("--print-segment-text", action="store_true")
     parser.add_argument(
