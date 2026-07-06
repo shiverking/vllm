@@ -182,7 +182,7 @@ class Qwen3ASRRealtimeMultiModalProcessor(Qwen3ASRMultiModalProcessor):
     dummy_inputs=Qwen3ASRDummyInputsBuilder,
 )
 class Qwen3ASRRealtimeGeneration(Qwen3ASRForConditionalGeneration, SupportsRealtime):
-    realtime_max_tokens = 64
+    realtime_max_tokens = 256
     realtime_use_streaming_input = False
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):

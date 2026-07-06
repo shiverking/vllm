@@ -49,6 +49,14 @@ def merge_transcription_delta(full_text: str, new_text: str) -> tuple[str, str]:
     return full_text + new_text, new_text
 
 
+def get_segment_separator(full_text: str, segment_text: str) -> str:
+    if not full_text or not segment_text:
+        return ""
+    if full_text[-1].isspace() or segment_text[0].isspace():
+        return ""
+    return " "
+
+
 class RealtimeConnection:
     """Manages WebSocket lifecycle and state for realtime transcription.
 
@@ -334,14 +342,22 @@ class RealtimeConnection:
                         )
 
                         input_stream.put_nowait(list(output.outputs[0].token_ids))
-                        if delta:
-                            full_text += delta
-                            await self.send(TranscriptionDelta(delta=delta))
 
                         completion_tokens_len += len(output.outputs[0].token_ids)
 
                     if not self._is_connected:
                         break
+
+                post_process_output = getattr(
+                    self.serving.model_cls, "post_process_output", None
+                )
+                if post_process_output is not None:
+                    segment_text = post_process_output(segment_text)
+                if segment_text:
+                    delta = get_segment_separator(full_text, segment_text)
+                    delta += segment_text
+                    full_text += delta
+                    await self.send(TranscriptionDelta(delta=delta))
 
                 if not self._is_connected:
                     break
