@@ -13,6 +13,9 @@ import websockets
 from tests.entrypoints.speech_to_text.conftest import add_attention_backend
 from tests.utils import ROCM_ENV_OVERRIDES, ROCM_EXTRA_ARGS, RemoteOpenAIServer
 from vllm.assets.audio import AudioAsset
+from vllm.entrypoints.speech_to_text.realtime.connection import (
+    merge_transcription_delta,
+)
 from vllm.multimodal.media.audio import load_audio
 
 # Increase engine iteration timeout for ROCm where first-use JIT compilation
@@ -32,6 +35,32 @@ MISTRAL_FORMAT_ARGS = [
 ] + ROCM_EXTRA_ARGS
 
 MODEL_NAME = "mistralai/Voxtral-Mini-4B-Realtime-2602"
+
+
+def test_merge_transcription_delta_handles_delta_and_cumulative_text():
+    text, delta = merge_transcription_delta("", "hello")
+    assert text == "hello"
+    assert delta == "hello"
+
+    text, delta = merge_transcription_delta(text, " world")
+    assert text == "hello world"
+    assert delta == " world"
+
+    text, delta = merge_transcription_delta(text, "hello world again")
+    assert text == "hello world again"
+    assert delta == " again"
+
+
+def test_merge_transcription_delta_drops_repeated_segments():
+    repeated_segment = "language English<asr_text>But, continued Raoul"
+
+    text, delta = merge_transcription_delta("", repeated_segment)
+    assert text == repeated_segment
+    assert delta == repeated_segment
+
+    text, delta = merge_transcription_delta(text, repeated_segment)
+    assert text == repeated_segment
+    assert delta == ""
 
 
 def _get_websocket_url(server: RemoteOpenAIServer) -> str:

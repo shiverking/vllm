@@ -31,6 +31,24 @@ from .serving import OpenAIServingRealtime
 logger = init_logger(__name__)
 
 
+def merge_transcription_delta(full_text: str, new_text: str) -> tuple[str, str]:
+    """Merge engine text into the transcript and return the emitted delta."""
+    if not new_text:
+        return full_text, ""
+
+    if new_text.startswith(full_text):
+        delta = new_text[len(full_text) :]
+        return new_text, delta
+
+    max_overlap = min(len(full_text), len(new_text))
+    for overlap in range(max_overlap, 0, -1):
+        if full_text.endswith(new_text[:overlap]):
+            delta = new_text[overlap:]
+            return full_text + delta, delta
+
+    return full_text + new_text, new_text
+
+
 class RealtimeConnection:
     """Manages WebSocket lifecycle and state for realtime transcription.
 
@@ -235,12 +253,14 @@ class RealtimeConnection:
                     if not prompt_token_ids_len and output.prompt_token_ids:
                         prompt_token_ids_len = len(output.prompt_token_ids)
 
-                    delta = output.outputs[0].text
-                    full_text += delta
+                    full_text, delta = merge_transcription_delta(
+                        full_text, output.outputs[0].text
+                    )
 
                     # append output to input
                     input_stream.put_nowait(list(output.outputs[0].token_ids))
-                    await self.send(TranscriptionDelta(delta=delta))
+                    if delta:
+                        await self.send(TranscriptionDelta(delta=delta))
 
                     completion_tokens_len += len(output.outputs[0].token_ids)
 
