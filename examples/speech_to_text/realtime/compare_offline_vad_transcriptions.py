@@ -43,6 +43,19 @@ class SegmentResult:
     result: TranscriptionResult
 
 
+@dataclass
+class AudioSegment:
+    index: int
+    audio: np.ndarray
+
+
+@dataclass
+class PipelineResult:
+    transcription: TranscriptionResult
+    segments: list[SegmentResult]
+    vad_time_s: float
+
+
 def clean_streamed_asr_text(text: str) -> str:
     if not text:
         return ""
@@ -69,40 +82,6 @@ def audio_to_wav_bytes(audio: np.ndarray) -> bytes:
             wav_file.setframerate(SAMPLE_RATE)
             wav_file.writeframes(pcm16.tobytes())
         return buffer.getvalue()
-
-
-def split_audio_with_silero(
-    audio: np.ndarray,
-    *,
-    threshold: float,
-    min_speech_ms: int,
-    min_silence_ms: int,
-    speech_pad_ms: int,
-    max_segment_s: float,
-    vad_chunk_duration_ms: int,
-) -> list[np.ndarray]:
-    detector = SileroSpeechDetector(
-        sampling_rate=SAMPLE_RATE,
-        threshold=threshold,
-    )
-    segmenter = RealtimeVADSegmenter(
-        detector,
-        sampling_rate=SAMPLE_RATE,
-        min_speech_duration_ms=min_speech_ms,
-        min_silence_duration_ms=min_silence_ms,
-        speech_pad_ms=speech_pad_ms,
-        max_segment_duration_s=max_segment_s,
-    )
-
-    chunk_samples = max(1, int(SAMPLE_RATE * vad_chunk_duration_ms / 1000))
-    segments: list[np.ndarray] = []
-    for start in range(0, len(audio), chunk_samples):
-        segments.extend(segmenter.write_audio(audio[start : start + chunk_samples]))
-
-    remaining = segmenter.flush()
-    if remaining is not None and len(remaining) > 0:
-        segments.append(remaining)
-    return segments
 
 
 async def transcribe_stream_bytes(
@@ -171,8 +150,8 @@ async def transcribe_stream_bytes(
     )
 
 
-async def transcribe_segments(
-    segments: list[np.ndarray],
+async def transcribe_vad_pipeline(
+    audio: np.ndarray,
     *,
     host: str,
     port: int,
@@ -181,37 +160,111 @@ async def transcribe_segments(
     max_completion_tokens: int,
     concurrency: int,
     print_segment_text: bool,
-) -> tuple[TranscriptionResult, list[SegmentResult]]:
-    semaphore = asyncio.Semaphore(concurrency)
-    batch_start_time = time.perf_counter()
+    threshold: float,
+    min_speech_ms: int,
+    min_silence_ms: int,
+    speech_pad_ms: int,
+    max_segment_s: float,
+    vad_chunk_duration_ms: int,
+) -> PipelineResult:
+    pipeline_start_time = time.perf_counter()
+    queue: asyncio.Queue[AudioSegment | None] = asyncio.Queue(
+        maxsize=max(1, concurrency * 2)
+    )
+    segment_results: list[SegmentResult] = []
+    vad_time_s: float | None = None
+
+    async def produce_segments() -> None:
+        nonlocal vad_time_s
+        detector = SileroSpeechDetector(
+            sampling_rate=SAMPLE_RATE,
+            threshold=threshold,
+        )
+        segmenter = RealtimeVADSegmenter(
+            detector,
+            sampling_rate=SAMPLE_RATE,
+            min_speech_duration_ms=min_speech_ms,
+            min_silence_duration_ms=min_silence_ms,
+            speech_pad_ms=speech_pad_ms,
+            max_segment_duration_s=max_segment_s,
+        )
+
+        chunk_samples = max(1, int(SAMPLE_RATE * vad_chunk_duration_ms / 1000))
+        next_index = 1
+        for start in range(0, len(audio), chunk_samples):
+            chunk = audio[start : start + chunk_samples]
+            segments = await asyncio.to_thread(segmenter.write_audio, chunk)
+            for segment in segments:
+                print(
+                    f"vad_segment_{next_index}: "
+                    f"{len(segment) / SAMPLE_RATE:.3f}s "
+                    f"({len(segment)} samples)."
+                )
+                await queue.put(AudioSegment(next_index, segment))
+                next_index += 1
+            await asyncio.sleep(0)
+
+        remaining = await asyncio.to_thread(segmenter.flush)
+        if remaining is not None and len(remaining) > 0:
+            print(
+                f"vad_segment_{next_index}: "
+                f"{len(remaining) / SAMPLE_RATE:.3f}s "
+                f"({len(remaining)} samples)."
+            )
+            await queue.put(AudioSegment(next_index, remaining))
+
+        vad_time_s = time.perf_counter() - pipeline_start_time
+        for _ in range(concurrency):
+            await queue.put(None)
 
     async with httpx.AsyncClient(timeout=None) as client:
 
-        async def run_segment(index: int, segment: np.ndarray) -> SegmentResult:
-            async with semaphore:
-                result = await transcribe_stream_bytes(
-                    client,
-                    audio_to_wav_bytes(segment),
-                    filename=f"vad_segment_{index}.wav",
-                    host=host,
-                    port=port,
-                    model=model,
-                    language=language,
-                    max_completion_tokens=max_completion_tokens,
-                    timing_start_time=batch_start_time,
-                    content_type="audio/wav",
-                )
-                duration_s = len(segment) / SAMPLE_RATE
-                if print_segment_text:
-                    print(f"vad_segment_{index}_duration={duration_s * 1000:.3f}ms")
-                    print(f"vad_segment_{index}_text={result.text}")
-                return SegmentResult(index, duration_s, result)
+        async def consume_segments() -> None:
+            while True:
+                item = await queue.get()
+                try:
+                    if item is None:
+                        return
+                    result = await transcribe_stream_bytes(
+                        client,
+                        audio_to_wav_bytes(item.audio),
+                        filename=f"vad_segment_{item.index}.wav",
+                        host=host,
+                        port=port,
+                        model=model,
+                        language=language,
+                        max_completion_tokens=max_completion_tokens,
+                        timing_start_time=pipeline_start_time,
+                        content_type="audio/wav",
+                    )
+                    duration_s = len(item.audio) / SAMPLE_RATE
+                    if print_segment_text:
+                        print(
+                            f"vad_segment_{item.index}_duration="
+                            f"{duration_s * 1000:.3f}ms"
+                        )
+                        print(f"vad_segment_{item.index}_text={result.text}")
+                    segment_results.append(
+                        SegmentResult(item.index, duration_s, result)
+                    )
+                finally:
+                    queue.task_done()
 
-        tasks = [
-            asyncio.create_task(run_segment(index, segment))
-            for index, segment in enumerate(segments, start=1)
+        producer_task = asyncio.create_task(produce_segments())
+        consumer_tasks = [
+            asyncio.create_task(consume_segments()) for _ in range(concurrency)
         ]
-        segment_results = await asyncio.gather(*tasks)
+        try:
+            await producer_task
+            await asyncio.gather(*consumer_tasks)
+        finally:
+            for task in consumer_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*consumer_tasks, return_exceptions=True)
+
+    if not segment_results:
+        raise RuntimeError("Silero VAD did not produce any speech segments.")
 
     segment_results.sort(key=lambda item: item.index)
     full_text = " ".join(
@@ -221,9 +274,14 @@ async def transcribe_segments(
     )
     first_ttft_s = min(item.result.ttft_s for item in segment_results)
     e2e_s = max(item.result.e2e_s for item in segment_results)
-    return (
-        TranscriptionResult(text=full_text, ttft_s=first_ttft_s, e2e_s=e2e_s),
-        segment_results,
+    return PipelineResult(
+        transcription=TranscriptionResult(
+            text=full_text,
+            ttft_s=first_ttft_s,
+            e2e_s=e2e_s,
+        ),
+        segments=segment_results,
+        vad_time_s=vad_time_s if vad_time_s is not None else e2e_s,
     )
 
 
@@ -374,30 +432,9 @@ async def compare(args: argparse.Namespace) -> None:
     if args.print_deltas:
         print()
 
-    print("Running offline Silero VAD segmentation...")
-    vad_start_time = time.perf_counter()
-    segments = split_audio_with_silero(
+    print("Running pipelined Silero VAD + transcription streams...")
+    pipeline_result = await transcribe_vad_pipeline(
         audio,
-        threshold=args.vad_threshold,
-        min_speech_ms=args.vad_min_speech_ms,
-        min_silence_ms=args.vad_min_silence_ms,
-        speech_pad_ms=args.vad_speech_pad_ms,
-        max_segment_s=args.vad_max_segment_s,
-        vad_chunk_duration_ms=args.vad_chunk_duration_ms,
-    )
-    vad_time_s = time.perf_counter() - vad_start_time
-    if not segments:
-        raise RuntimeError("Silero VAD did not produce any speech segments.")
-
-    for index, segment in enumerate(segments, start=1):
-        print(
-            f"vad_segment_{index}: "
-            f"{len(segment) / SAMPLE_RATE:.3f}s ({len(segment)} samples)."
-        )
-
-    print("Running segmented /v1/audio/transcriptions stream=true requests...")
-    vad_transcription, segment_results = await transcribe_segments(
-        segments,
         host=args.host,
         port=args.port,
         model=args.model,
@@ -405,7 +442,15 @@ async def compare(args: argparse.Namespace) -> None:
         max_completion_tokens=args.segment_max_completion_tokens,
         concurrency=args.segment_concurrency,
         print_segment_text=args.print_segment_text,
+        threshold=args.vad_threshold,
+        min_speech_ms=args.vad_min_speech_ms,
+        min_silence_ms=args.vad_min_silence_ms,
+        speech_pad_ms=args.vad_speech_pad_ms,
+        max_segment_s=args.vad_max_segment_s,
+        vad_chunk_duration_ms=args.vad_chunk_duration_ms,
     )
+    vad_transcription = pipeline_result.transcription
+    segment_results = pipeline_result.segments
 
     metrics = calculate_metrics(
         baseline.text,
@@ -416,11 +461,6 @@ async def compare(args: argparse.Namespace) -> None:
     )
 
     speech_duration_s = sum(item.duration_s for item in segment_results)
-    vad_result = TranscriptionResult(
-        text=vad_transcription.text,
-        ttft_s=vad_time_s + vad_transcription.ttft_s,
-        e2e_s=vad_time_s + vad_transcription.e2e_s,
-    )
     print("\n=== Transcription Stream Baseline ===")
     print(baseline.text)
     print("\n=== Offline VAD Transcription ===")
@@ -428,7 +468,7 @@ async def compare(args: argparse.Namespace) -> None:
     print("\n=== Summary ===")
     print("\n[audio]")
     print(f"audio_duration={audio_duration_s * 1000:.3f}ms")
-    print(f"vad_time={vad_time_s * 1000:.3f}ms")
+    print(f"vad_time={pipeline_result.vad_time_s * 1000:.3f}ms")
     print(f"vad_segments={len(segment_results)}")
     print(f"vad_speech_duration={speech_duration_s * 1000:.3f}ms")
     print(
@@ -447,7 +487,7 @@ async def compare(args: argparse.Namespace) -> None:
 
     print("\n[performance]")
     print_performance("baseline", baseline, audio_duration_s)
-    print_performance("vad", vad_result, audio_duration_s)
+    print_performance("vad", vad_transcription, audio_duration_s)
 
     print("\n[quality]")
     print(
