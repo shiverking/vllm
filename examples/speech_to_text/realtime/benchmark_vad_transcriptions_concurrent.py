@@ -36,6 +36,7 @@ except ImportError:  # pragma: no cover
 SAMPLE_RATE = 16000
 BYTES_PER_SAMPLE = 2
 AUDIO_EXTS = {".wav", ".mp3", ".flac", ".m4a", ".ogg", ".aac", ".opus"}
+VAD_LOCK = threading.Lock()
 
 
 @dataclass
@@ -364,20 +365,46 @@ def run_vad_audio_request(
         vad_init_s = 0.0
         vad_time_s = 0.0
         if audio_offset < len(audio):
-            vad_init_start = time.perf_counter()
-            segmenter = create_segmenter(args)
-            vad_init_s = time.perf_counter() - vad_init_start
-            vad_scan_start = time.perf_counter()
-            chunk_samples = max(
-                1, int(SAMPLE_RATE * args.vad_chunk_duration_ms / 1000)
-            )
+            # Silero/PyTorch native backends can crash the client process when
+            # several benchmark threads call the local VAD at the same time.
+            # Segment ASR requests still run concurrently; only local VAD scans
+            # are serialized.
+            with VAD_LOCK:
+                vad_init_start = time.perf_counter()
+                segmenter = create_segmenter(args)
+                vad_init_s = time.perf_counter() - vad_init_start
+                vad_scan_start = time.perf_counter()
+                chunk_samples = max(
+                    1, int(SAMPLE_RATE * args.vad_chunk_duration_ms / 1000)
+                )
 
-            for start in range(audio_offset, len(audio), chunk_samples):
-                chunk = audio[start:start + chunk_samples]
-                for segment_audio in segmenter.write_audio(chunk):
+                for start in range(audio_offset, len(audio), chunk_samples):
+                    chunk = audio[start:start + chunk_samples]
+                    for segment_audio in segmenter.write_audio(chunk):
+                        segment = Segment(
+                            index=next_index,
+                            audio=segment_audio,
+                            mode="silero",
+                            emit_offset_s=(
+                                time.perf_counter() - job_start_time
+                            ),
+                        )
+                        futures.append(
+                            executor.submit(
+                                transcribe_segment,
+                                segment,
+                                url=url,
+                                args=args,
+                                job_start_time=job_start_time,
+                            )
+                        )
+                        next_index += 1
+
+                remaining = segmenter.flush()
+                if remaining is not None and len(remaining) > 0:
                     segment = Segment(
                         index=next_index,
-                        audio=segment_audio,
+                        audio=remaining,
                         mode="silero",
                         emit_offset_s=time.perf_counter() - job_start_time,
                     )
@@ -390,27 +417,8 @@ def run_vad_audio_request(
                             job_start_time=job_start_time,
                         )
                     )
-                    next_index += 1
 
-            remaining = segmenter.flush()
-            if remaining is not None and len(remaining) > 0:
-                segment = Segment(
-                    index=next_index,
-                    audio=remaining,
-                    mode="silero",
-                    emit_offset_s=time.perf_counter() - job_start_time,
-                )
-                futures.append(
-                    executor.submit(
-                        transcribe_segment,
-                        segment,
-                        url=url,
-                        args=args,
-                        job_start_time=job_start_time,
-                    )
-                )
-
-            vad_time_s = time.perf_counter() - vad_scan_start
+                vad_time_s = time.perf_counter() - vad_scan_start
 
         for future in as_completed(futures):
             segment_results.append(future.result())
