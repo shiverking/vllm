@@ -153,11 +153,13 @@ async def capture_system_audio(target_ws, browser_ws, stop_event: asyncio.Event)
     )
     print(f"[audio] Capturing system audio from: {microphone.name}")
 
+    loop = asyncio.get_running_loop()
     with microphone.recorder(samplerate=SAMPLE_RATE, channels=2) as recorder:
         while not stop_event.is_set():
-            frames = await asyncio.to_thread(
+            frames = await loop.run_in_executor(
+                None,
                 recorder.record,
-                numframes=chunk_frames,
+                chunk_frames,
             )
             await target_ws.send(
                 json.dumps({
