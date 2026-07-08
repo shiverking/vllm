@@ -10,9 +10,11 @@ const CONNECT_TIMEOUT_MS = 30000;
 const serverUrlInput = document.querySelector("#server-url");
 const modelInput = document.querySelector("#model");
 const startButton = document.querySelector("#start-btn");
+const systemAudioButton = document.querySelector("#system-audio-btn");
 const stopButton = document.querySelector("#stop-btn");
 const transcript = document.querySelector("#transcript");
 const statusBadge = document.querySelector("#status");
+const ttftValue = document.querySelector("#ttft");
 
 let socket = null;
 let mediaStream = null;
@@ -24,12 +26,16 @@ let committedFinalAudio = false;
 let sessionConfigured = false;
 let sessionReady = false;
 let running = false;
+let activeMode = null;
+let ttftStartTime = null;
+let firstTokenReceived = false;
 
 const text = {
   idle: "\u672a\u8fde\u63a5",
   emptyUrl: "\u5730\u5740\u4e3a\u7a7a",
   connecting: "\u8fde\u63a5\u4e2d",
   recording: "\u6b63\u5728\u5f55\u97f3",
+  systemRecording: "\u6b63\u5728\u6355\u83b7\u7cfb\u7edf\u97f3\u9891",
   transcribing: "\u6b63\u5728\u8f6c\u5199",
   done: "\u5df2\u5b8c\u6210",
   error: "\u53d1\u751f\u9519\u8bef",
@@ -52,8 +58,30 @@ function setStatus(value, kind = "idle") {
   statusBadge.classList.toggle("error", kind === "error");
 }
 
+function resetTtft() {
+  ttftStartTime = performance.now();
+  firstTokenReceived = false;
+  ttftValue.textContent = "--";
+}
+
+function clearTtftTimer() {
+  ttftStartTime = null;
+  firstTokenReceived = false;
+}
+
+function recordTtft() {
+  if (firstTokenReceived || ttftStartTime === null) {
+    return;
+  }
+
+  const elapsedMs = performance.now() - ttftStartTime;
+  ttftValue.textContent = `${Math.round(elapsedMs)}ms`;
+  firstTokenReceived = true;
+}
+
 function setControls(isRunning) {
   startButton.disabled = isRunning;
+  systemAudioButton.disabled = isRunning;
   stopButton.disabled = !isRunning;
   serverUrlInput.disabled = isRunning;
   modelInput.disabled = isRunning;
@@ -61,6 +89,7 @@ function setControls(isRunning) {
 
 function setWaitingControls() {
   startButton.disabled = true;
+  systemAudioButton.disabled = true;
   stopButton.disabled = true;
   serverUrlInput.disabled = true;
   modelInput.disabled = true;
@@ -205,7 +234,15 @@ function handleServerMessage(message) {
     return;
   }
 
+  if (event.type === "system_audio.started") {
+    setStatus(text.systemRecording, "live");
+    return;
+  }
+
   if (event.type === "transcription.delta") {
+    if (event.delta) {
+      recordTtft();
+    }
     appendTranscript(event.delta || "");
     setStatus(text.transcribing, "live");
     return;
@@ -214,6 +251,8 @@ function handleServerMessage(message) {
   if (event.type === "transcription.done") {
     setFinalTranscript(event.text);
     setStatus(text.done, "idle");
+    running = false;
+    activeMode = null;
     closeSocket();
     setControls(false);
     return;
@@ -262,6 +301,15 @@ function buildBackendWebSocketUrl(targetUrl) {
   return url.toString();
 }
 
+function buildSystemAudioWebSocketUrl(targetUrl) {
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const hostname = window.location.hostname || "127.0.0.1";
+  const url = new URL(`${protocol}//${hostname}:8765/system-audio`);
+  url.searchParams.set("target", targetUrl);
+  url.searchParams.set("model", modelInput.value.trim());
+  return url.toString();
+}
+
 async function startAudioCapture() {
   mediaStream = await navigator.mediaDevices.getUserMedia({
     audio: {
@@ -298,6 +346,8 @@ async function startRecording() {
   sessionConfigured = false;
   sessionReady = false;
   running = true;
+  activeMode = "microphone";
+  resetTtft();
   setControls(true);
   setStatus(text.connecting, "live");
 
@@ -319,6 +369,51 @@ async function startRecording() {
 
     configureSession();
     await startAudioCapture();
+  } catch (error) {
+    appendTranscript(`[${text.errorPrefix}] ${error.message}\n`);
+    if (error.message === text.connectTimeout) {
+      appendTranscript(`${text.connectHint}\n`);
+    }
+    setStatus(text.startupFailed, "error");
+    stopRecording(false);
+  }
+}
+
+async function startSystemAudioCapture() {
+  const targetUrl = serverUrlInput.value.trim();
+  if (!targetUrl) {
+    setStatus(text.emptyUrl, "error");
+    return;
+  }
+
+  transcript.value = "";
+  pendingInput = new Float32Array(0);
+  committedFinalAudio = false;
+  sessionConfigured = false;
+  sessionReady = false;
+  running = true;
+  activeMode = "system";
+  resetTtft();
+  setControls(true);
+  setStatus(text.connecting, "live");
+
+  try {
+    socket = await connectWebSocket(buildSystemAudioWebSocketUrl(targetUrl));
+    socket.addEventListener("message", handleServerMessage);
+    socket.addEventListener("close", () => {
+      if (running) {
+        setStatus(text.disconnected, "error");
+        stopRecording(false);
+      }
+    });
+    socket.addEventListener("error", () => {
+      if (running) {
+        setStatus(text.connectionError, "error");
+        stopRecording(false);
+      }
+    });
+
+    setStatus(text.systemRecording, "live");
   } catch (error) {
     appendTranscript(`[${text.errorPrefix}] ${error.message}\n`);
     if (error.message === text.connectTimeout) {
@@ -372,6 +467,8 @@ async function stopRecording(sendFinalCommit = true) {
   const wasRunning = running;
   running = false;
   sessionReady = false;
+  activeMode = null;
+  clearTtftTimer();
 
   stopTracks();
   stopAudioNodes();
@@ -401,6 +498,7 @@ async function stopRecording(sendFinalCommit = true) {
 }
 
 startButton.addEventListener("click", startRecording);
+systemAudioButton.addEventListener("click", startSystemAudioCapture);
 stopButton.addEventListener("click", () => stopRecording(true));
 
 window.addEventListener("beforeunload", () => {

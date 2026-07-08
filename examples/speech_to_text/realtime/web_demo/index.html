@@ -18,8 +18,14 @@ SPDX-FileCopyrightText: Copyright contributors to the vLLM project
             <p class="eyebrow">vLLM Realtime</p>
             <h1 id="page-title">&#23454;&#26102;&#35821;&#38899;&#36716;&#20889;</h1>
           </div>
-          <div class="status" id="status" role="status">
-            &#26410;&#36830;&#25509;
+          <div class="metrics">
+            <div class="status" id="status" role="status">
+              &#26410;&#36830;&#25509;
+            </div>
+            <div class="metric">
+              <span>TTFT</span>
+              <strong id="ttft">--</strong>
+            </div>
           </div>
         </header>
 
@@ -49,6 +55,9 @@ SPDX-FileCopyrightText: Copyright contributors to the vLLM project
         <div class="actions">
           <button id="start-btn" class="primary" type="button">
             &#24320;&#22987;
+          </button>
+          <button id="system-audio-btn" type="button">
+            &#25429;&#33719;&#31995;&#32479;&#38899;&#39057;
           </button>
           <button id="stop-btn" type="button" disabled>
             &#32467;&#26463;
