@@ -5,6 +5,7 @@
 
 const TARGET_SAMPLE_RATE = 16000;
 const CHUNK_DURATION_MS = 100;
+const CONNECT_TIMEOUT_MS = 5000;
 
 const serverUrlInput = document.querySelector("#server-url");
 const modelInput = document.querySelector("#model");
@@ -20,11 +21,31 @@ let sourceNode = null;
 let processorNode = null;
 let pendingInput = new Float32Array(0);
 let committedFinalAudio = false;
+let sessionConfigured = false;
 let sessionReady = false;
 let running = false;
 
-function setStatus(text, kind = "idle") {
-  statusBadge.textContent = text;
+const text = {
+  idle: "\u672a\u8fde\u63a5",
+  emptyUrl: "\u5730\u5740\u4e3a\u7a7a",
+  connecting: "\u8fde\u63a5\u4e2d",
+  recording: "\u6b63\u5728\u5f55\u97f3",
+  transcribing: "\u6b63\u5728\u8f6c\u5199",
+  done: "\u5df2\u5b8c\u6210",
+  error: "\u53d1\u751f\u9519\u8bef",
+  disconnected: "\u8fde\u63a5\u5df2\u65ad\u5f00",
+  connectionError: "\u8fde\u63a5\u9519\u8bef",
+  startupFailed: "\u542f\u52a8\u5931\u8d25",
+  waiting: "\u7b49\u5f85\u7ed3\u679c",
+  ended: "\u5df2\u7ed3\u675f",
+  serverError: "\u670d\u52a1\u7aef\u8fd4\u56de\u9519\u8bef",
+  connectFailed: "\u65e0\u6cd5\u8fde\u63a5\u5230 realtime \u670d\u52a1",
+  connectTimeout: "\u8fde\u63a5 realtime \u670d\u52a1\u8d85\u65f6",
+  errorPrefix: "\u9519\u8bef",
+};
+
+function setStatus(value, kind = "idle") {
+  statusBadge.textContent = value;
   statusBadge.classList.toggle("live", kind === "live");
   statusBadge.classList.toggle("error", kind === "error");
 }
@@ -43,13 +64,13 @@ function setWaitingControls() {
   modelInput.disabled = true;
 }
 
-function appendTranscript(text) {
-  transcript.value += text;
+function appendTranscript(value) {
+  transcript.value += value;
   transcript.scrollTop = transcript.scrollHeight;
 }
 
-function setFinalTranscript(text) {
-  transcript.value = text || transcript.value;
+function setFinalTranscript(value) {
+  transcript.value = value || transcript.value;
   transcript.scrollTop = transcript.scrollHeight;
 }
 
@@ -116,6 +137,21 @@ function sendEvent(event) {
   socket.send(JSON.stringify(event));
 }
 
+function configureSession(force = false) {
+  if (sessionConfigured && !force) {
+    return;
+  }
+
+  const model = modelInput.value.trim();
+  if (model) {
+    sendEvent({ type: "session.update", model });
+  }
+  sendEvent({ type: "input_audio_buffer.commit" });
+  sessionConfigured = true;
+  sessionReady = true;
+  setStatus(text.recording, "live");
+}
+
 function sendAudioChunk(samples) {
   const pcmBytes = floatToPcm16Bytes(samples);
   sendEvent({
@@ -163,34 +199,28 @@ function handleServerMessage(message) {
   }
 
   if (event.type === "session.created") {
-    const model = modelInput.value.trim();
-    if (model) {
-      sendEvent({ type: "session.update", model });
-    }
-    sendEvent({ type: "input_audio_buffer.commit" });
-    sessionReady = true;
-    setStatus("正在录音", "live");
+    configureSession(true);
     return;
   }
 
   if (event.type === "transcription.delta") {
     appendTranscript(event.delta || "");
-    setStatus("正在转写", "live");
+    setStatus(text.transcribing, "live");
     return;
   }
 
   if (event.type === "transcription.done") {
     setFinalTranscript(event.text);
-    setStatus("已完成", "idle");
+    setStatus(text.done, "idle");
     closeSocket();
     setControls(false);
     return;
   }
 
   if (event.type === "error") {
-    const detail = event.error?.message || event.error || "服务端返回错误";
-    setStatus("发生错误", "error");
-    appendTranscript(`\n[错误] ${detail}\n`);
+    const detail = event.error?.message || event.error || text.serverError;
+    setStatus(text.error, "error");
+    appendTranscript(`\n[${text.errorPrefix}] ${detail}\n`);
     stopRecording(false);
   }
 }
@@ -198,11 +228,25 @@ function handleServerMessage(message) {
 function connectWebSocket(url) {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(url);
+    const timeout = window.setTimeout(() => {
+      ws.close();
+      reject(new Error(text.connectTimeout));
+    }, CONNECT_TIMEOUT_MS);
 
-    ws.addEventListener("open", () => resolve(ws), { once: true });
+    ws.addEventListener(
+      "open",
+      () => {
+        window.clearTimeout(timeout);
+        resolve(ws);
+      },
+      { once: true },
+    );
     ws.addEventListener(
       "error",
-      () => reject(new Error("无法连接到 realtime 服务")),
+      () => {
+        window.clearTimeout(timeout);
+        reject(new Error(text.connectFailed));
+      },
       { once: true },
     );
   });
@@ -234,38 +278,40 @@ async function startAudioCapture() {
 async function startRecording() {
   const url = serverUrlInput.value.trim();
   if (!url) {
-    setStatus("地址为空", "error");
+    setStatus(text.emptyUrl, "error");
     return;
   }
 
   transcript.value = "";
   pendingInput = new Float32Array(0);
   committedFinalAudio = false;
+  sessionConfigured = false;
   sessionReady = false;
   running = true;
   setControls(true);
-  setStatus("连接中", "live");
+  setStatus(text.connecting, "live");
 
   try {
     socket = await connectWebSocket(url);
     socket.addEventListener("message", handleServerMessage);
     socket.addEventListener("close", () => {
       if (running) {
-        setStatus("连接已断开", "error");
+        setStatus(text.disconnected, "error");
         stopRecording(false);
       }
     });
     socket.addEventListener("error", () => {
       if (running) {
-        setStatus("连接错误", "error");
+        setStatus(text.connectionError, "error");
         stopRecording(false);
       }
     });
 
+    configureSession();
     await startAudioCapture();
   } catch (error) {
-    appendTranscript(`[错误] ${error.message}\n`);
-    setStatus("启动失败", "error");
+    appendTranscript(`[${text.errorPrefix}] ${error.message}\n`);
+    setStatus(text.startupFailed, "error");
     stopRecording(false);
   }
 }
@@ -328,11 +374,11 @@ async function stopRecording(sendFinalCommit = true) {
     sendEvent({ type: "input_audio_buffer.commit", final: true });
     committedFinalAudio = true;
     setWaitingControls();
-    setStatus("等待结果", "live");
+    setStatus(text.waiting, "live");
   } else if (wasRunning) {
     closeSocket();
     setControls(false);
-    setStatus("已结束", "idle");
+    setStatus(text.ended, "idle");
   } else {
     closeSocket();
     setControls(false);

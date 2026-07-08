@@ -16,28 +16,30 @@ SPDX-FileCopyrightText: Copyright contributors to the vLLM project
         <header class="header">
           <div>
             <p class="eyebrow">vLLM Realtime</p>
-            <h1 id="page-title">实时语音转写</h1>
+            <h1 id="page-title">&#23454;&#26102;&#35821;&#38899;&#36716;&#20889;</h1>
           </div>
-          <div class="status" id="status" role="status">未连接</div>
+          <div class="status" id="status" role="status">
+            &#26410;&#36830;&#25509;
+          </div>
         </header>
 
         <div class="settings">
           <label class="field">
-            <span>服务地址</span>
+            <span>&#26381;&#21153;&#22320;&#22336;</span>
             <input
               id="server-url"
               type="url"
-              value="ws://127.0.0.1:8000/v1/realtime"
+              value="ws://135.30.72.115:1025/v1/realtime"
               autocomplete="off"
               spellcheck="false"
             />
           </label>
           <label class="field">
-            <span>模型</span>
+            <span>&#27169;&#22411;</span>
             <input
               id="model"
               type="text"
-              value="mistralai/Voxtral-Mini-4B-Realtime-2602"
+              value="Qwen3-ASR-1.7B"
               autocomplete="off"
               spellcheck="false"
             />
@@ -45,14 +47,20 @@ SPDX-FileCopyrightText: Copyright contributors to the vLLM project
         </div>
 
         <div class="actions">
-          <button id="start-btn" class="primary" type="button">开始</button>
-          <button id="stop-btn" type="button" disabled>结束</button>
+          <button id="start-btn" class="primary" type="button">
+            &#24320;&#22987;
+          </button>
+          <button id="stop-btn" type="button" disabled>
+            &#32467;&#26463;
+          </button>
         </div>
 
-        <label class="transcript-label" for="transcript">转写结果</label>
+        <label class="transcript-label" for="transcript">
+          &#36716;&#20889;&#32467;&#26524;
+        </label>
         <textarea
           id="transcript"
-          placeholder="点击开始后，说话内容会实时显示在这里。"
+          placeholder="&#28857;&#20987;&#24320;&#22987;&#21518;&#65292;&#35828;&#35805;&#20869;&#23481;&#20250;&#23454;&#26102;&#26174;&#31034;&#22312;&#36825;&#37324;&#12290;"
           readonly
         ></textarea>
       </section>

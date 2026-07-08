@@ -7,7 +7,7 @@ transcription text back into the page.
 Start a realtime-capable vLLM server first, for example:
 
 ```powershell
-vllm serve mistralai/Voxtral-Mini-4B-Realtime-2602 --enforce-eager
+vllm serve Qwen3-ASR-1.7B --enforce-eager
 ```
 
 Then serve this directory from localhost:
@@ -26,7 +26,13 @@ http://localhost:8080
 The page defaults to:
 
 ```text
-ws://127.0.0.1:8000/v1/realtime
+ws://135.30.72.115:1025/v1/realtime
+```
+
+and model:
+
+```text
+Qwen3-ASR-1.7B
 ```
 
 Change the WebSocket URL and model name in the page before clicking Start.
