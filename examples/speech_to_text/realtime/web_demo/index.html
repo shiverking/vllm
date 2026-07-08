@@ -1,0 +1,63 @@
+<!--
+SPDX-License-Identifier: Apache-2.0
+SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-->
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Realtime ASR Demo</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="panel" aria-labelledby="page-title">
+        <header class="header">
+          <div>
+            <p class="eyebrow">vLLM Realtime</p>
+            <h1 id="page-title">实时语音转写</h1>
+          </div>
+          <div class="status" id="status" role="status">未连接</div>
+        </header>
+
+        <div class="settings">
+          <label class="field">
+            <span>服务地址</span>
+            <input
+              id="server-url"
+              type="url"
+              value="ws://127.0.0.1:8000/v1/realtime"
+              autocomplete="off"
+              spellcheck="false"
+            />
+          </label>
+          <label class="field">
+            <span>模型</span>
+            <input
+              id="model"
+              type="text"
+              value="mistralai/Voxtral-Mini-4B-Realtime-2602"
+              autocomplete="off"
+              spellcheck="false"
+            />
+          </label>
+        </div>
+
+        <div class="actions">
+          <button id="start-btn" class="primary" type="button">开始</button>
+          <button id="stop-btn" type="button" disabled>结束</button>
+        </div>
+
+        <label class="transcript-label" for="transcript">转写结果</label>
+        <textarea
+          id="transcript"
+          placeholder="点击开始后，说话内容会实时显示在这里。"
+          readonly
+        ></textarea>
+      </section>
+    </main>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
