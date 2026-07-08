@@ -5,7 +5,7 @@
 
 const TARGET_SAMPLE_RATE = 16000;
 const CHUNK_DURATION_MS = 100;
-const CONNECT_TIMEOUT_MS = 5000;
+const CONNECT_TIMEOUT_MS = 30000;
 
 const serverUrlInput = document.querySelector("#server-url");
 const modelInput = document.querySelector("#model");
@@ -39,8 +39,10 @@ const text = {
   waiting: "\u7b49\u5f85\u7ed3\u679c",
   ended: "\u5df2\u7ed3\u675f",
   serverError: "\u670d\u52a1\u7aef\u8fd4\u56de\u9519\u8bef",
-  connectFailed: "\u65e0\u6cd5\u8fde\u63a5\u5230 realtime \u670d\u52a1",
-  connectTimeout: "\u8fde\u63a5 realtime \u670d\u52a1\u8d85\u65f6",
+  connectFailed: "\u65e0\u6cd5\u8fde\u63a5\u5230 Python \u540e\u7aef",
+  connectTimeout: "\u8fde\u63a5 Python \u540e\u7aef\u8d85\u65f6",
+  connectHint:
+    "\u8bf7\u786e\u8ba4\u5df2\u542f\u52a8 realtime_web_demo_server.py\uff0c\u5e76\u4ece\u5b83\u6253\u5370\u7684 http://127.0.0.1:8080 \u6253\u5f00\u9875\u9762\u3002",
   errorPrefix: "\u9519\u8bef",
 };
 
@@ -252,6 +254,14 @@ function connectWebSocket(url) {
   });
 }
 
+function buildBackendWebSocketUrl(targetUrl) {
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const hostname = window.location.hostname || "127.0.0.1";
+  const url = new URL(`${protocol}//${hostname}:8765/ws`);
+  url.searchParams.set("target", targetUrl);
+  return url.toString();
+}
+
 async function startAudioCapture() {
   mediaStream = await navigator.mediaDevices.getUserMedia({
     audio: {
@@ -276,8 +286,8 @@ async function startAudioCapture() {
 }
 
 async function startRecording() {
-  const url = serverUrlInput.value.trim();
-  if (!url) {
+  const targetUrl = serverUrlInput.value.trim();
+  if (!targetUrl) {
     setStatus(text.emptyUrl, "error");
     return;
   }
@@ -292,7 +302,7 @@ async function startRecording() {
   setStatus(text.connecting, "live");
 
   try {
-    socket = await connectWebSocket(url);
+    socket = await connectWebSocket(buildBackendWebSocketUrl(targetUrl));
     socket.addEventListener("message", handleServerMessage);
     socket.addEventListener("close", () => {
       if (running) {
@@ -311,6 +321,9 @@ async function startRecording() {
     await startAudioCapture();
   } catch (error) {
     appendTranscript(`[${text.errorPrefix}] ${error.message}\n`);
+    if (error.message === text.connectTimeout) {
+      appendTranscript(`${text.connectHint}\n`);
+    }
     setStatus(text.startupFailed, "error");
     stopRecording(false);
   }

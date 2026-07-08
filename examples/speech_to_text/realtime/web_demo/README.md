@@ -1,43 +1,37 @@
 # Realtime ASR Web Demo
 
-This is a minimal browser demo for the vLLM Realtime WebSocket API. It captures
-microphone audio, sends PCM16 16 kHz mono chunks to the server, and streams
-transcription text back into the page.
+This is a minimal browser demo for the vLLM Realtime WebSocket API. The browser
+only connects to a local Python backend. The Python backend serves the page,
+connects to the model server, relays microphone audio, and relays streaming
+transcription events back to the page.
 
-Start a realtime-capable vLLM server first, for example:
-
-```powershell
-vllm serve Qwen3-ASR-1.7B --enforce-eager
-```
-
-Then serve this directory from localhost:
+Start the backend:
 
 ```powershell
 cd examples\speech_to_text\realtime\web_demo
-..\..\..\..\.venv\Scripts\python -m http.server 8080
+..\..\..\..\.venv\Scripts\python realtime_web_demo_server.py --target ws://135.30.72.115:1025/v1/realtime
 ```
 
-Open:
+Open the page printed by the backend:
 
 ```text
-http://localhost:8080
+http://127.0.0.1:8080
 ```
 
 The page defaults to:
 
 ```text
-ws://135.30.72.115:1025/v1/realtime
+Model server URL: ws://135.30.72.115:1025/v1/realtime
+Model: Qwen3-ASR-1.7B
 ```
 
-and model:
+The browser sends audio to the Python backend at:
 
 ```text
-Qwen3-ASR-1.7B
+ws://127.0.0.1:8765/ws
 ```
 
-Change the WebSocket URL and model name in the page before clicking Start.
-
-The demo sends:
+The backend then relays the same realtime events to the model server:
 
 ```json
 {"type": "session.update", "model": "<model>"}
@@ -46,5 +40,5 @@ The demo sends:
 {"type": "input_audio_buffer.commit", "final": true}
 ```
 
-It displays `transcription.delta` events as streaming text and replaces the
-text area with `transcription.done.text` when the final result arrives.
+The page displays `transcription.delta` events as streaming text and replaces
+the text area with `transcription.done.text` when the final result arrives.
