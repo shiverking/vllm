@@ -45,7 +45,11 @@ from transformers.models.whisper import WhisperFeatureExtractor
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import ModelConfig, SpeechToTextConfig, VllmConfig
 from vllm.config.speech_to_text import SpeechToTextParams
-from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_pp_group,
+    get_tensor_model_parallel_world_size,
+    get_tp_group,
+)
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import _ACTIVATION_REGISTRY
@@ -228,7 +232,8 @@ class Qwen3OmniMoeAudioAttention(nn.Module):
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
         max_seqlen: torch.Tensor | None,
-    ) -> torch.Tensor:
+        return_attention_importance: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         seq_length, _ = hidden_states.size()
         qkv, _ = self.qkv(hidden_states)
         q, k, v = qkv.chunk(3, dim=-1)
@@ -246,6 +251,25 @@ class Qwen3OmniMoeAudioAttention(nn.Module):
 
         attn_output = attn_output.view(seq_length, -1)
         output, _ = self.out_proj(attn_output)
+        if return_attention_importance:
+            importance_parts = []
+            chunk_starts = cu_seqlens[:-1].tolist()
+            chunk_ends = cu_seqlens[1:].tolist()
+            for start, end in zip(chunk_starts, chunk_ends):
+                query = q[0, start:end].float().transpose(0, 1)
+                key = k[0, start:end].float().transpose(0, 1)
+                attention = torch.softmax(
+                    torch.matmul(query, key.transpose(-1, -2)) * self.scaling,
+                    dim=-1,
+                )
+                local_head_max = attention.max(dim=0).values
+                gathered = get_tp_group().all_gather(local_head_max, dim=0)
+                importance_parts.append(
+                    gathered.view(-1, *local_head_max.shape)
+                    .max(dim=0)
+                    .values.mean(dim=0)
+                )
+            return output, torch.cat(importance_parts)
         return output
 
 
@@ -283,7 +307,8 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
         max_seqlen: torch.Tensor | None,
-    ) -> torch.Tensor:
+        return_attention_importance: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             hidden_states: Input tensor of shape (seq_len, hidden_size)
@@ -292,11 +317,16 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
         """
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
-        hidden_states = self.self_attn(
+        attention_output = self.self_attn(
             hidden_states=hidden_states,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            return_attention_importance=return_attention_importance,
         )
+        if return_attention_importance:
+            hidden_states, attention_importance = attention_output
+        else:
+            hidden_states = attention_output
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -313,6 +343,8 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
                 hidden_states, min=-clamp_value, max=clamp_value
             )
 
+        if return_attention_importance:
+            return hidden_states, attention_importance
         return hidden_states
 
 
@@ -425,6 +457,8 @@ class Qwen3OmniMoeAudioEncoder(nn.Module):
         input_features: torch.Tensor,
         feature_lens: torch.Tensor,
         aftercnn_lens: torch.Tensor,
+        return_attention_importance: bool = False,
+        attention_layer: int = -2,
     ):
         # Compute chunk information
         chunk_num = torch.ceil(feature_lens / (self.n_window * 2)).long()
@@ -508,12 +542,21 @@ class Qwen3OmniMoeAudioEncoder(nn.Module):
         max_seqlen = self.compute_attn_mask_seqlen(cu_seqlens)
 
         # Apply transformer layers
-        for encoder_layer in self.layers:
-            hidden_states = encoder_layer(
+        selected_layer = attention_layer % len(self.layers)
+        attention_importance = None
+        for layer_index, encoder_layer in enumerate(self.layers):
+            layer_output = encoder_layer(
                 hidden_states,
                 cu_seqlens,
                 max_seqlen,
+                return_attention_importance=(
+                    return_attention_importance and layer_index == selected_layer
+                ),
             )
+            if return_attention_importance and layer_index == selected_layer:
+                hidden_states, attention_importance = layer_output
+            else:
+                hidden_states = layer_output
 
         # Apply output layers
         hidden_states = self.ln_post(hidden_states)
@@ -521,6 +564,9 @@ class Qwen3OmniMoeAudioEncoder(nn.Module):
         hidden_states = self.act(hidden_states)
         hidden_states = self.proj2(hidden_states)
 
+        if return_attention_importance:
+            assert attention_importance is not None
+            return hidden_states, attention_importance
         return hidden_states
 
     def _get_cnn_output_lengths(self, input_lengths: torch.Tensor) -> torch.Tensor:

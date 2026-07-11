@@ -28,6 +28,7 @@ from typing import Any
 import regex as re
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.models.whisper import WhisperFeatureExtractor
 
@@ -127,6 +128,116 @@ def _get_feat_extract_output_lengths(input_lengths: torch.Tensor):
     return output_lengths
 
 
+def _get_sa_map_output_lengths(
+    input_lengths: torch.Tensor, retention_ratio: float
+) -> torch.Tensor:
+    output_lengths = _get_feat_extract_output_lengths(input_lengths)
+    if retention_ratio >= 1.0:
+        return output_lengths
+    return torch.clamp(
+        torch.round(output_lengths.float() * retention_ratio).long(), min=2
+    )
+
+
+def _sa_map_compress(
+    features: torch.Tensor,
+    importance: torch.Tensor,
+    target_length: int,
+    similarity_threshold: float,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Compress projected audio tokens using SA-MAP G-SAM and ADPruner."""
+    num_tokens = features.shape[0]
+    if target_length >= num_tokens:
+        return features
+
+    normalized = F.normalize(features.float(), dim=-1, eps=eps)
+    similarity = normalized @ normalized.T
+    weights = torch.nan_to_num(importance.float(), nan=1.0, posinf=1.0)
+    weights = weights.clamp_min(eps)
+
+    groups: list[torch.Tensor] = []
+    start = 0
+    while start < num_tokens:
+        end = start + 1
+        while end < num_tokens:
+            mean_similarity = similarity[end, start:end].mean()
+            if mean_similarity < similarity_threshold:
+                break
+            end += 1
+        groups.append(torch.arange(start, end, device=features.device))
+        start = end
+
+    merged_features = []
+    merged_importance = []
+    for group in groups:
+        group_weights = weights[group]
+        merged_features.append(
+            (features[group] * group_weights[:, None].to(features.dtype)).sum(0)
+            / group_weights.sum().to(features.dtype)
+        )
+        merged_importance.append(group_weights.mean())
+
+    merged = torch.stack(merged_features)
+    if merged.shape[0] <= target_length:
+        # A low threshold can over-merge. Split the largest temporal groups
+        # until the fixed placeholder contract is met.
+        if merged.shape[0] < target_length:
+            return _sa_map_limit_merging(
+                features, weights, groups, target_length, eps
+            )
+        return merged
+
+    relevance = torch.stack(merged_importance)
+    merged_normalized = F.normalize(merged.float(), dim=-1, eps=eps)
+    kernel = relevance[:, None] * (merged_normalized @ merged_normalized.T)
+    kernel = kernel * relevance[None, :]
+
+    cis = torch.zeros(
+        (target_length, merged.shape[0]), device=features.device, dtype=torch.float32
+    )
+    di2s = kernel.diagonal().clone().clamp_min(eps)
+    selected = torch.empty(target_length, device=features.device, dtype=torch.long)
+    for step in range(target_length):
+        index = di2s.argmax()
+        selected[step] = index
+        correction = torch.einsum(
+            "t,tn->n", cis[:step, index], cis[:step]
+        )
+        eis = (kernel[index] - correction) / di2s[index].sqrt().clamp_min(eps)
+        cis[step] = eis
+        di2s = (di2s - eis.square()).clamp_min(0)
+        di2s[selected[: step + 1]] = -1
+
+    return merged[selected.sort().values]
+
+
+def _sa_map_limit_merging(
+    features: torch.Tensor,
+    weights: torch.Tensor,
+    groups: list[torch.Tensor],
+    target_length: int,
+    eps: float,
+) -> torch.Tensor:
+    """Undo the least necessary merges to preserve the fixed output length."""
+    while len(groups) < target_length:
+        sizes = torch.tensor([len(group) for group in groups])
+        group_index = int(sizes.argmax())
+        group = groups[group_index]
+        if len(group) <= 1:
+            break
+        groups[group_index : group_index + 1] = [group[:-1], group[-1:]]
+
+    outputs = []
+    for group in groups:
+        group_weights = weights[group].clamp_min(eps)
+        outputs.append(
+            (features[group] * group_weights[:, None].to(features.dtype)).sum(0)
+            / group_weights.sum().to(features.dtype)
+        )
+    return torch.stack(outputs)
+
+
 class Qwen3ASRProcessingInfo(BaseProcessingInfo):
     def get_hf_config(self):
         return self.ctx.get_hf_config(Qwen3ASRConfig).thinker_config
@@ -139,6 +250,9 @@ class Qwen3ASRProcessingInfo(BaseProcessingInfo):
         )
         if not hasattr(processor, "audio_token"):
             processor.audio_token = "<|audio_pad|>"
+        hf_config = self.ctx.get_hf_config(Qwen3ASRConfig)
+        if hf_config.sa_map_enabled:
+            processor.sa_map_retention_ratio = hf_config.sa_map_retention_ratio
         return processor
 
     def get_feature_extractor(self, **kwargs: object) -> WhisperFeatureExtractor:
@@ -261,6 +375,13 @@ class Qwen3ASRMultiModalProcessor(
             )
             audio_output_lengths = audio_output_lens.tolist()
 
+        hf_config = self.info.ctx.get_hf_config(Qwen3ASRConfig)
+        if hf_config.sa_map_enabled and audio_output_lengths:
+            audio_output_lengths = [
+                max(round(length * hf_config.sa_map_retention_ratio), 2)
+                for length in audio_output_lengths
+            ]
+
         def get_replacement_qwen2_audio(item_idx: int):
             num_features = audio_output_lengths[item_idx]
             if num_features == 0:
@@ -334,6 +455,7 @@ class Qwen3ASRForConditionalGeneration(
         quant_config = vllm_config.quant_config
         multimodal_config = vllm_config.model_config.multimodal_config
         self.config = thinker_config
+        self.hf_config: Qwen3ASRConfig = vllm_config.model_config.hf_config
         self.multimodal_config = multimodal_config
         self.quant_config = quant_config
 
@@ -395,12 +517,34 @@ class Qwen3ASRForConditionalGeneration(
 
         audio_output_lengths = _get_feat_extract_output_lengths(audio_feature_lengths)
 
-        audio_features = self.audio_tower(
+        audio_tower_output = self.audio_tower(
             input_features.to(self.audio_tower.dtype),
             feature_lens=audio_feature_lengths,
             aftercnn_lens=audio_output_lengths,
+            return_attention_importance=self.hf_config.sa_map_enabled,
+            attention_layer=self.hf_config.sa_map_attention_layer,
         )
-        return audio_features.split(audio_output_lengths.tolist())
+        if not self.hf_config.sa_map_enabled:
+            return audio_tower_output.split(audio_output_lengths.tolist())
+
+        audio_features, importance = audio_tower_output
+        features_by_audio = audio_features.split(audio_output_lengths.tolist())
+        importance_by_audio = importance.split(audio_output_lengths.tolist())
+        target_lengths = _get_sa_map_output_lengths(
+            audio_feature_lengths, self.hf_config.sa_map_retention_ratio
+        )
+        compressed = [
+            _sa_map_compress(
+                features,
+                scores,
+                int(target_length),
+                self.hf_config.sa_map_similarity_threshold,
+            )
+            for features, scores, target_length in zip(
+                features_by_audio, importance_by_audio, target_lengths
+            )
+        ]
+        return tuple(compressed)
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings | None:
         mm_input_by_modality = self._parse_and_validate_multimodal_inputs(**kwargs)
@@ -506,6 +650,10 @@ class Qwen3ASRForConditionalGeneration(
             audio_len = _get_feat_extract_output_lengths(
                 torch.tensor(audio_feature_length)
             ).item()
+            if self.hf_config.sa_map_enabled:
+                audio_len = max(
+                    round(audio_len * self.hf_config.sa_map_retention_ratio), 2
+                )
 
             # Text segment before audio (includes audio_start token)
             text_len = offset - st

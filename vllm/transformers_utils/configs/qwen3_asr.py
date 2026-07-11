@@ -410,8 +410,18 @@ class Qwen3ASRConfig(PretrainedConfig):
         support_languages=None,
         timestamp_token_id=None,
         timestamp_segment_time=None,
+        sa_map_enabled=False,
+        sa_map_retention_ratio=1.0,
+        sa_map_similarity_threshold=0.85,
+        sa_map_attention_layer=-2,
         **kwargs,
     ):
+        if not 0 < sa_map_retention_ratio <= 1:
+            raise ValueError("sa_map_retention_ratio must be in the interval (0, 1]")
+        if not -1 <= sa_map_similarity_threshold <= 1:
+            raise ValueError(
+                "sa_map_similarity_threshold must be in the interval [-1, 1]"
+            )
         if thinker_config is None:
             thinker_config = {}
             logger.info(
@@ -422,6 +432,10 @@ class Qwen3ASRConfig(PretrainedConfig):
         self.support_languages = support_languages
         self.timestamp_token_id = timestamp_token_id
         self.timestamp_segment_time = timestamp_segment_time
+        self.sa_map_enabled = sa_map_enabled
+        self.sa_map_retention_ratio = sa_map_retention_ratio
+        self.sa_map_similarity_threshold = sa_map_similarity_threshold
+        self.sa_map_attention_layer = sa_map_attention_layer
         super().__init__(**kwargs)
 
     def get_text_config(self, decoder=False) -> "PretrainedConfig":

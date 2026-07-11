@@ -20,6 +20,7 @@
 import regex as re
 
 import numpy as np
+import torch
 
 from transformers import AutoProcessor
 from transformers.audio_utils import AudioInput
@@ -55,6 +56,20 @@ def _get_feat_extract_output_lengths(input_lengths):
     return output_lengths
 
 
+def _get_sa_map_output_lengths(input_lengths, retention_ratio=1.0):
+    """Compute the fixed output length expected from SA-MAP compression."""
+    output_lengths = _get_feat_extract_output_lengths(input_lengths)
+    if retention_ratio >= 1.0:
+        return output_lengths
+    if isinstance(output_lengths, torch.Tensor):
+        return torch.clamp(
+            torch.round(output_lengths.float() * retention_ratio).long(), min=2
+        )
+    return np.maximum(np.rint(output_lengths * retention_ratio), 2).astype(
+        output_lengths.dtype
+    )
+
+
 class Qwen3ASRProcessor(ProcessorMixin):
     r"""
     Constructs a Qwen3ASR processor.
@@ -79,6 +94,7 @@ class Qwen3ASRProcessor(ProcessorMixin):
         self.audio_token = self.tokenizer.audio_token
         self.audio_bos_token = self.tokenizer.audio_bos_token
         self.audio_eos_token = self.tokenizer.audio_eos_token
+        self.sa_map_retention_ratio = 1.0
 
     def __call__(
         self,
@@ -124,8 +140,9 @@ class Qwen3ASRProcessor(ProcessorMixin):
                 "input_features"
             )  # rename input_features to prevent conflicts later on
             audio_lengths = iter(
-                _get_feat_extract_output_lengths(
-                    audio_inputs["feature_attention_mask"].sum(-1)
+                _get_sa_map_output_lengths(
+                    audio_inputs["feature_attention_mask"].sum(-1),
+                    self.sa_map_retention_ratio,
                 )
             )
         else:
