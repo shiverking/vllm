@@ -179,13 +179,28 @@ def _sa_map_compress(
         merged_importance.append(group_weights.mean())
 
     merged = torch.stack(merged_features)
+    logger.debug(
+        "SA-MAP G-SAM grouped %d audio tokens into %d tokens "
+        "(target=%d, threshold=%.3f)",
+        num_tokens,
+        merged.shape[0],
+        target_length,
+        similarity_threshold,
+    )
     if merged.shape[0] <= target_length:
         # A low threshold can over-merge. Split the largest temporal groups
         # until the fixed placeholder contract is met.
         if merged.shape[0] < target_length:
-            return _sa_map_limit_merging(
+            limited = _sa_map_limit_merging(
                 features, weights, groups, target_length, eps
             )
+            logger.debug(
+                "SA-MAP limited over-merging: %d -> %d tokens",
+                merged.shape[0],
+                limited.shape[0],
+            )
+            return limited
+        logger.debug("SA-MAP completed with merging only: %d tokens", target_length)
         return merged
 
     relevance = torch.stack(merged_importance)
@@ -209,7 +224,13 @@ def _sa_map_compress(
         di2s = (di2s - eis.square()).clamp_min(0)
         di2s[selected[: step + 1]] = -1
 
-    return merged[selected.sort().values]
+    output = merged[selected.sort().values]
+    logger.debug(
+        "SA-MAP ADPruner selected %d of %d merged tokens",
+        output.shape[0],
+        merged.shape[0],
+    )
+    return output
 
 
 def _sa_map_limit_merging(
@@ -459,6 +480,15 @@ class Qwen3ASRForConditionalGeneration(
         self.multimodal_config = multimodal_config
         self.quant_config = quant_config
 
+        if self.hf_config.sa_map_enabled:
+            logger.info(
+                "SA-MAP enabled for Qwen3-ASR: retention_ratio=%.3f, "
+                "similarity_threshold=%.3f, attention_layer=%d",
+                self.hf_config.sa_map_retention_ratio,
+                self.hf_config.sa_map_similarity_threshold,
+                self.hf_config.sa_map_attention_layer,
+            )
+
         with self._mark_tower_model(vllm_config, "audio"):
             self.audio_tower = Qwen3OmniMoeAudioEncoder(
                 thinker_config.audio_config,
@@ -532,6 +562,11 @@ class Qwen3ASRForConditionalGeneration(
         importance_by_audio = importance.split(audio_output_lengths.tolist())
         target_lengths = _get_sa_map_output_lengths(
             audio_feature_lengths, self.hf_config.sa_map_retention_ratio
+        )
+        logger.debug(
+            "SA-MAP audio batch lengths: original=%s, target=%s",
+            audio_output_lengths.tolist(),
+            target_lengths.tolist(),
         )
         compressed = [
             _sa_map_compress(

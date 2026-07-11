@@ -544,6 +544,13 @@ class Qwen3OmniMoeAudioEncoder(nn.Module):
         # Apply transformer layers
         selected_layer = attention_layer % len(self.layers)
         attention_importance = None
+        if return_attention_importance:
+            logger.debug(
+                "Collecting Qwen3 audio attention importance from layer %d "
+                "(%d packed attention chunks)",
+                selected_layer,
+                cu_seqlens.numel() - 1,
+            )
         for layer_index, encoder_layer in enumerate(self.layers):
             layer_output = encoder_layer(
                 hidden_states,
