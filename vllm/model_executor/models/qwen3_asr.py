@@ -153,7 +153,15 @@ def _sa_map_compress(
 
     normalized = F.normalize(features.float(), dim=-1, eps=eps)
     similarity = normalized @ normalized.T
-    weights = torch.nan_to_num(importance.float(), nan=1.0, posinf=1.0)
+    weights = importance.float()
+    # torch.nan_to_num is unavailable on some Ascend devices (for example
+    # 310P). Attention probabilities should normally be finite, but retain a
+    # backend-friendly fallback for malformed values.
+    weights = torch.where(
+        (weights == weights) & (weights.abs() != float("inf")),
+        weights,
+        torch.ones_like(weights),
+    )
     weights = weights.clamp_min(eps)
 
     groups: list[torch.Tensor] = []
