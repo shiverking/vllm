@@ -187,7 +187,7 @@ def _sa_map_compress(
         merged_importance.append(group_weights.mean())
 
     merged = torch.stack(merged_features)
-    logger.debug(
+    logger.info(
         "SA-MAP G-SAM grouped %d audio tokens into %d tokens "
         "(target=%d, threshold=%.3f)",
         num_tokens,
@@ -202,13 +202,13 @@ def _sa_map_compress(
             limited = _sa_map_limit_merging(
                 features, weights, groups, target_length, eps
             )
-            logger.debug(
+            logger.info(
                 "SA-MAP limited over-merging: %d -> %d tokens",
                 merged.shape[0],
                 limited.shape[0],
             )
             return limited
-        logger.debug("SA-MAP completed with merging only: %d tokens", target_length)
+        logger.info("SA-MAP completed with merging only: %d tokens", target_length)
         return merged
 
     relevance = torch.stack(merged_importance)
@@ -233,7 +233,7 @@ def _sa_map_compress(
         di2s[selected[: step + 1]] = -1
 
     output = merged[selected.sort().values]
-    logger.debug(
+    logger.info(
         "SA-MAP ADPruner selected %d of %d merged tokens",
         output.shape[0],
         merged.shape[0],
@@ -571,7 +571,7 @@ class Qwen3ASRForConditionalGeneration(
         target_lengths = _get_sa_map_output_lengths(
             audio_feature_lengths, self.hf_config.sa_map_retention_ratio
         )
-        logger.debug(
+        logger.info(
             "SA-MAP audio batch lengths: original=%s, target=%s",
             audio_output_lengths.tolist(),
             target_lengths.tolist(),
