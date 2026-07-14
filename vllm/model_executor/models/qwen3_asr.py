@@ -140,6 +140,34 @@ def _get_sa_map_output_lengths(
     )
 
 
+def _greedy_dpp_select(
+    kernel: torch.Tensor,
+    selection_count: int,
+    eps: float,
+) -> torch.Tensor:
+    num_tokens = kernel.shape[0]
+    cis = torch.zeros(
+        (selection_count, num_tokens), device=kernel.device, dtype=torch.float32
+    )
+    di2s = kernel.diagonal().clone().clamp_min(eps)
+    selected = torch.empty(
+        selection_count, device=kernel.device, dtype=torch.long
+    )
+    for step in range(selection_count):
+        index = di2s.argmax()
+        selected[step] = index
+        correction = torch.einsum(
+            "t,tn->n", cis[:step, index], cis[:step]
+        )
+        eis = (kernel[index] - correction) / (
+            di2s[index].sqrt().clamp_min(eps)
+        )
+        cis[step] = eis
+        di2s = (di2s - eis.square()).clamp_min(0)
+        di2s[selected[: step + 1]] = -1
+    return selected
+
+
 def _sa_map_compress(
     features: torch.Tensor,
     importance: torch.Tensor,
@@ -269,33 +297,50 @@ def _sa_map_compress(
     )
 
     dpp_start = time.perf_counter()
-    cis = torch.zeros(
-        (target_length, merged.shape[0]), device="cpu", dtype=torch.float32
-    )
-    di2s = kernel_cpu.diagonal().clone().clamp_min(eps)
-    selected = torch.empty(target_length, device="cpu", dtype=torch.long)
-    for step in range(target_length):
-        index = di2s.argmax()
-        selected[step] = index
-        correction = torch.einsum(
-            "t,tn->n", cis[:step, index], cis[:step]
+    num_merged = merged.shape[0]
+    num_to_remove = num_merged - target_length
+    identity = torch.eye(num_merged, device="cpu", dtype=torch.float32)
+    jitter = eps
+    precision = None
+    for _ in range(5):
+        cholesky, info = torch.linalg.cholesky_ex(
+            kernel_cpu + jitter * identity
         )
-        eis = (kernel_cpu[index] - correction) / (
-            di2s[index].sqrt().clamp_min(eps)
-        )
-        cis[step] = eis
-        di2s = (di2s - eis.square()).clamp_min(0)
-        di2s[selected[: step + 1]] = -1
+        if not bool(info.any()):
+            candidate = torch.cholesky_inverse(cholesky)
+            if bool(torch.isfinite(candidate).all()):
+                precision = candidate
+                break
+        jitter *= 10
 
-    selected_cpu = selected.sort().values
+    if precision is None:
+        logger.warning(
+            "SA-MAP Complement DPP factorization failed; falling back to "
+            "forward CPU greedy selection"
+        )
+        selected_cpu = _greedy_dpp_select(
+            kernel_cpu, target_length, eps
+        ).sort().values
+        dpp_mode = "forward-fallback"
+    else:
+        removed = _greedy_dpp_select(precision, num_to_remove, eps)
+        keep_mask = torch.ones(num_merged, device="cpu", dtype=torch.bool)
+        keep_mask[removed] = False
+        selected_cpu = torch.arange(num_merged, device="cpu")[keep_mask]
+        dpp_mode = "complement"
+
     dpp_elapsed_ms = (time.perf_counter() - dpp_start) * 1000
     selected_device = selected_cpu.to(merged.device)
     output = merged[selected_device]
     logger.info(
-        "SA-MAP CPU ADPruner selected %d of %d merged tokens in %.2f ms",
+        "SA-MAP CPU ADPruner selected %d of %d merged tokens in %.2f ms "
+        "(mode=%s, greedy_steps=%d, jitter=%.1e)",
         output.shape[0],
         merged.shape[0],
         dpp_elapsed_ms,
+        dpp_mode,
+        num_to_remove if dpp_mode == "complement" else target_length,
+        jitter,
     )
     return output
 
