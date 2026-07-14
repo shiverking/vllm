@@ -227,6 +227,37 @@ class Qwen3OmniMoeAudioAttention(nn.Module):
             prefix=f"{prefix}.attn",
         )
 
+    def _eager_attention_with_importance(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        output_parts = []
+        importance_parts = []
+        chunk_boundaries = cu_seqlens.tolist()
+        for start, end in zip(chunk_boundaries[:-1], chunk_boundaries[1:]):
+            query = q[0, start:end].float().transpose(0, 1)
+            key = k[0, start:end].float().transpose(0, 1)
+            value = v[0, start:end].float().transpose(0, 1)
+            attention = torch.softmax(
+                torch.matmul(query, key.transpose(-1, -2)) * self.scaling,
+                dim=-1,
+            )
+            output_parts.append(torch.matmul(attention, value).transpose(0, 1))
+
+            local_head_max = attention.max(dim=0).values
+            gathered = get_tp_group().all_gather(local_head_max, dim=0)
+            importance_parts.append(
+                gathered.view(-1, *local_head_max.shape)
+                .max(dim=0)
+                .values.mean(dim=0)
+            )
+
+        output = torch.cat(output_parts, dim=0).to(q.dtype).unsqueeze(0)
+        return output, torch.cat(importance_parts)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -241,35 +272,25 @@ class Qwen3OmniMoeAudioAttention(nn.Module):
         k = k.view(1, seq_length, -1, self.head_dim)
         v = v.view(1, seq_length, -1, self.head_dim)
 
-        attn_output = self.attn(
-            query=q,
-            key=k,
-            value=v,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-        )
+        attention_importance = None
+        if return_attention_importance:
+            attn_output, attention_importance = (
+                self._eager_attention_with_importance(q, k, v, cu_seqlens)
+            )
+        else:
+            attn_output = self.attn(
+                query=q,
+                key=k,
+                value=v,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+            )
 
         attn_output = attn_output.view(seq_length, -1)
         output, _ = self.out_proj(attn_output)
         if return_attention_importance:
-            importance_parts = []
-            chunk_starts = cu_seqlens[:-1].tolist()
-            chunk_ends = cu_seqlens[1:].tolist()
-            for start, end in zip(chunk_starts, chunk_ends):
-                query = q[0, start:end].float().transpose(0, 1)
-                key = k[0, start:end].float().transpose(0, 1)
-                attention = torch.softmax(
-                    torch.matmul(query, key.transpose(-1, -2)) * self.scaling,
-                    dim=-1,
-                )
-                local_head_max = attention.max(dim=0).values
-                gathered = get_tp_group().all_gather(local_head_max, dim=0)
-                importance_parts.append(
-                    gathered.view(-1, *local_head_max.shape)
-                    .max(dim=0)
-                    .values.mean(dim=0)
-                )
-            return output, torch.cat(importance_parts)
+            assert attention_importance is not None
+            return output, attention_importance
         return output
 
 
@@ -546,8 +567,8 @@ class Qwen3OmniMoeAudioEncoder(nn.Module):
         attention_importance = None
         if return_attention_importance:
             logger.info(
-                "Collecting Qwen3 audio attention importance from layer %d "
-                "(%d packed attention chunks)",
+                "Collecting Qwen3 audio attention importance with single-pass "
+                "eager attention from layer %d (%d packed attention chunks)",
                 selected_layer,
                 cu_seqlens.numel() - 1,
             )
