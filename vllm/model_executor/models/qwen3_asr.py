@@ -180,7 +180,7 @@ def _sa_map_compress(
     if target_length >= num_tokens:
         return features
 
-    normalized = F.normalize(features.float(), dim=-1, eps=eps)
+    normalized = F.normalize(features, dim=-1, eps=eps)
     similarity = normalized @ normalized.T
     weights = importance.float()
     # torch.nan_to_num is unavailable on some Ascend devices (for example
@@ -255,11 +255,12 @@ def _sa_map_compress(
     )
     logger.info(
         "SA-MAP G-SAM grouped %d audio tokens into %d tokens "
-        "(target=%d, threshold=%.3f)",
+        "(target=%d, threshold=%.3f, gram_dtype=%s)",
         num_tokens,
         merged.shape[0],
         target_length,
         similarity_threshold,
+        similarity.dtype,
     )
     if merged.shape[0] <= target_length:
         # A low threshold can over-merge. Split the largest temporal groups
@@ -282,7 +283,7 @@ def _sa_map_compress(
         return merged
 
     relevance = merged_importance
-    merged_normalized = F.normalize(merged.float(), dim=-1, eps=eps)
+    merged_normalized = F.normalize(merged, dim=-1, eps=eps)
     kernel = relevance[:, None] * (merged_normalized @ merged_normalized.T)
     kernel = kernel * relevance[None, :]
 
