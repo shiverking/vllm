@@ -219,12 +219,12 @@ def _sa_map_compress(
         group_ranges.append((start, end))
         start = end
 
-    group_ids_cpu = torch.empty(num_tokens, dtype=torch.long)
-    group_counts_cpu = torch.empty(len(group_ranges), dtype=torch.float32)
-    for group_id, (group_start, group_end) in enumerate(group_ranges):
-        group_ids_cpu[group_start:group_end] = group_id
-        group_counts_cpu[group_id] = group_end - group_start
-    group_ids = group_ids_cpu.to(features.device)
+    num_groups = len(group_ranges)
+    group_boundaries_cpu = torch.tensor(
+        [0] + [group_end for _, group_end in group_ranges],
+        dtype=torch.long,
+    )
+    group_boundaries = group_boundaries_cpu.to(features.device)
     logger.info(
         "SA-MAP CPU grouping completed in %.2f ms for %d tokens",
         (time.perf_counter() - grouping_start) * 1000,
@@ -232,24 +232,36 @@ def _sa_map_compress(
     )
 
     merge_start = time.perf_counter()
-    num_groups = len(group_ranges)
     weighted_features = features * weights[:, None].to(features.dtype)
-    feature_sums = torch.zeros(
-        (num_groups, features.shape[-1]),
-        device=features.device,
-        dtype=features.dtype,
+    feature_cumsum = weighted_features.float().cumsum(dim=0)
+    feature_prefix = torch.cat(
+        (
+            torch.zeros_like(feature_cumsum[:1]),
+            feature_cumsum,
+        ),
+        dim=0,
     )
-    feature_sums.index_add_(0, group_ids, weighted_features)
+    feature_sums = (
+        feature_prefix.index_select(0, group_boundaries[1:])
+        - feature_prefix.index_select(0, group_boundaries[:-1])
+    )
 
-    weight_sums = torch.zeros(
-        num_groups, device=features.device, dtype=weights.dtype
+    weight_prefix = torch.cat(
+        (torch.zeros_like(weights[:1]), weights.cumsum(dim=0)), dim=0
     )
-    weight_sums.index_add_(0, group_ids, weights)
-    merged = feature_sums / weight_sums[:, None].to(features.dtype).clamp_min(eps)
-    group_counts = group_counts_cpu.to(features.device)
+    weight_sums = (
+        weight_prefix.index_select(0, group_boundaries[1:])
+        - weight_prefix.index_select(0, group_boundaries[:-1])
+    )
+    merged = (feature_sums / weight_sums[:, None].clamp_min(eps)).to(
+        features.dtype
+    )
+    group_counts = (group_boundaries[1:] - group_boundaries[:-1]).to(
+        weights.dtype
+    )
     merged_importance = weight_sums / group_counts
     logger.info(
-        "SA-MAP vectorized merge enqueued in %.2f ms for %d groups",
+        "SA-MAP prefix-sum merge enqueued in %.2f ms for %d groups",
         (time.perf_counter() - merge_start) * 1000,
         num_groups,
     )
