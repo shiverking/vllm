@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from vllm.model_executor.models.qwen3_asr import (
+    _fast_redundancy_prune,
     _get_sa_map_output_lengths,
     _sa_map_compress,
 )
@@ -66,6 +67,16 @@ def test_sa_map_pruning_has_fixed_length_and_finite_output():
     assert output.argmax(dim=-1).tolist() == [0, 2, 4]
 
 
+def test_sa_map_fast_pruning_removes_redundant_low_relevance_token():
+    similarity = torch.eye(4)
+    similarity[0, 1] = similarity[1, 0] = 0.99
+    relevance = torch.tensor([10.0, 1.0, 8.0, 7.0])
+
+    removed = _fast_redundancy_prune(similarity, relevance, 1, 1e-6)
+
+    assert removed.tolist() == [1]
+
+
 def test_sa_map_overmerge_is_limited_to_target_length():
     features = torch.ones(8, 3)
     importance = torch.arange(1, 9, dtype=torch.float32)
@@ -83,6 +94,8 @@ def test_sa_map_overmerge_is_limited_to_target_length():
         ("sa_map_retention_ratio", 1.1),
         ("sa_map_similarity_threshold", -1.1),
         ("sa_map_similarity_threshold", 1.1),
+        ("sa_map_fast_prune_ratio", -0.1),
+        ("sa_map_fast_prune_ratio", 1.1),
     ],
 )
 def test_sa_map_config_validation(field: str, value: float):

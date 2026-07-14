@@ -414,6 +414,7 @@ class Qwen3ASRConfig(PretrainedConfig):
         sa_map_retention_ratio=1.0,
         sa_map_similarity_threshold=0.85,
         sa_map_attention_layer=-2,
+        sa_map_fast_prune_ratio=0.1,
         **kwargs,
     ):
         if not 0 < sa_map_retention_ratio <= 1:
@@ -421,6 +422,10 @@ class Qwen3ASRConfig(PretrainedConfig):
         if not -1 <= sa_map_similarity_threshold <= 1:
             raise ValueError(
                 "sa_map_similarity_threshold must be in the interval [-1, 1]"
+            )
+        if not 0 <= sa_map_fast_prune_ratio <= 1:
+            raise ValueError(
+                "sa_map_fast_prune_ratio must be in the interval [0, 1]"
             )
         if thinker_config is None:
             thinker_config = {}
@@ -436,6 +441,7 @@ class Qwen3ASRConfig(PretrainedConfig):
         self.sa_map_retention_ratio = sa_map_retention_ratio
         self.sa_map_similarity_threshold = sa_map_similarity_threshold
         self.sa_map_attention_layer = sa_map_attention_layer
+        self.sa_map_fast_prune_ratio = sa_map_fast_prune_ratio
         super().__init__(**kwargs)
 
     def get_text_config(self, decoder=False) -> "PretrainedConfig":

@@ -168,11 +168,31 @@ def _greedy_dpp_select(
     return selected
 
 
+def _fast_redundancy_prune(
+    similarity: torch.Tensor,
+    relevance: torch.Tensor,
+    removal_count: int,
+    eps: float,
+) -> torch.Tensor:
+    num_tokens = similarity.shape[0]
+    indices = torch.arange(num_tokens, device=similarity.device)
+    higher_relevance = relevance[None, :] > relevance[:, None]
+    equal_relevance = relevance[None, :] == relevance[:, None]
+    earlier_token = indices[None, :] < indices[:, None]
+    eligible_reference = higher_relevance | (equal_relevance & earlier_token)
+    redundancy = (
+        similarity.masked_fill(~eligible_reference, -1).max(dim=1).values
+    )
+    removal_score = (redundancy.clamp_min(0) + eps) / relevance.clamp_min(eps)
+    return removal_score.topk(removal_count).indices
+
+
 def _sa_map_compress(
     features: torch.Tensor,
     importance: torch.Tensor,
     target_length: int,
     similarity_threshold: float,
+    fast_prune_ratio: float = 0.1,
     eps: float = 1e-6,
 ) -> torch.Tensor:
     """Compress projected audio tokens using SA-MAP G-SAM and ADPruner."""
@@ -296,7 +316,44 @@ def _sa_map_compress(
 
     relevance = merged_importance
     merged_normalized = F.normalize(merged, dim=-1, eps=eps)
-    kernel = relevance[:, None] * (merged_normalized @ merged_normalized.T)
+    merged_similarity = merged_normalized @ merged_normalized.T
+    num_merged = merged.shape[0]
+    num_to_remove = num_merged - target_length
+    if fast_prune_ratio > 0 and num_to_remove / num_merged <= fast_prune_ratio:
+        transfer_start = time.perf_counter()
+        similarity_cpu = merged_similarity.detach().to(
+            device="cpu", dtype=torch.float32
+        )
+        relevance_cpu = relevance.detach().to(device="cpu", dtype=torch.float32)
+        logger.info(
+            "SA-MAP synchronized and transferred %d x %d similarity matrix "
+            "to CPU in %.2f ms",
+            similarity_cpu.shape[0],
+            similarity_cpu.shape[1],
+            (time.perf_counter() - transfer_start) * 1000,
+        )
+
+        prune_start = time.perf_counter()
+        removed = _fast_redundancy_prune(
+            similarity_cpu, relevance_cpu, num_to_remove, eps
+        )
+        keep_mask = torch.ones(num_merged, device="cpu", dtype=torch.bool)
+        keep_mask[removed] = False
+        selected_cpu = torch.arange(num_merged, device="cpu")[keep_mask]
+        prune_elapsed_ms = (time.perf_counter() - prune_start) * 1000
+        output = merged[selected_cpu.to(merged.device)]
+        logger.info(
+            "SA-MAP fast ADPruner selected %d of %d merged tokens in %.2f ms "
+            "(removed=%d, max_ratio=%.3f)",
+            output.shape[0],
+            num_merged,
+            prune_elapsed_ms,
+            num_to_remove,
+            fast_prune_ratio,
+        )
+        return output
+
+    kernel = relevance[:, None] * merged_similarity
     kernel = kernel * relevance[None, :]
 
     transfer_start = time.perf_counter()
@@ -310,8 +367,6 @@ def _sa_map_compress(
     )
 
     dpp_start = time.perf_counter()
-    num_merged = merged.shape[0]
-    num_to_remove = num_merged - target_length
     identity = torch.eye(num_merged, device="cpu", dtype=torch.float32)
     jitter = eps
     precision = None
@@ -608,10 +663,12 @@ class Qwen3ASRForConditionalGeneration(
         if self.hf_config.sa_map_enabled:
             logger.info(
                 "SA-MAP enabled for Qwen3-ASR: retention_ratio=%.3f, "
-                "similarity_threshold=%.3f, attention_layer=%d",
+                "similarity_threshold=%.3f, attention_layer=%d, "
+                "fast_prune_ratio=%.3f",
                 self.hf_config.sa_map_retention_ratio,
                 self.hf_config.sa_map_similarity_threshold,
                 self.hf_config.sa_map_attention_layer,
+                self.hf_config.sa_map_fast_prune_ratio,
             )
 
         with self._mark_tower_model(vllm_config, "audio"):
@@ -699,6 +756,7 @@ class Qwen3ASRForConditionalGeneration(
                 scores,
                 int(target_length),
                 self.hf_config.sa_map_similarity_threshold,
+                self.hf_config.sa_map_fast_prune_ratio,
             )
             for features, scores, target_length in zip(
                 features_by_audio, importance_by_audio, target_lengths
