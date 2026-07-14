@@ -258,27 +258,44 @@ def _sa_map_compress(
     kernel = relevance[:, None] * (merged_normalized @ merged_normalized.T)
     kernel = kernel * relevance[None, :]
 
-    cis = torch.zeros(
-        (target_length, merged.shape[0]), device=features.device, dtype=torch.float32
+    transfer_start = time.perf_counter()
+    kernel_cpu = kernel.detach().to(device="cpu", dtype=torch.float32)
+    logger.info(
+        "SA-MAP synchronized and transferred %d x %d DPP kernel to CPU "
+        "in %.2f ms",
+        kernel_cpu.shape[0],
+        kernel_cpu.shape[1],
+        (time.perf_counter() - transfer_start) * 1000,
     )
-    di2s = kernel.diagonal().clone().clamp_min(eps)
-    selected = torch.empty(target_length, device=features.device, dtype=torch.long)
+
+    dpp_start = time.perf_counter()
+    cis = torch.zeros(
+        (target_length, merged.shape[0]), device="cpu", dtype=torch.float32
+    )
+    di2s = kernel_cpu.diagonal().clone().clamp_min(eps)
+    selected = torch.empty(target_length, device="cpu", dtype=torch.long)
     for step in range(target_length):
         index = di2s.argmax()
         selected[step] = index
         correction = torch.einsum(
             "t,tn->n", cis[:step, index], cis[:step]
         )
-        eis = (kernel[index] - correction) / di2s[index].sqrt().clamp_min(eps)
+        eis = (kernel_cpu[index] - correction) / (
+            di2s[index].sqrt().clamp_min(eps)
+        )
         cis[step] = eis
         di2s = (di2s - eis.square()).clamp_min(0)
         di2s[selected[: step + 1]] = -1
 
-    output = merged[selected.sort().values]
+    selected_cpu = selected.sort().values
+    dpp_elapsed_ms = (time.perf_counter() - dpp_start) * 1000
+    selected_device = selected_cpu.to(merged.device)
+    output = merged[selected_device]
     logger.info(
-        "SA-MAP ADPruner selected %d of %d merged tokens",
+        "SA-MAP CPU ADPruner selected %d of %d merged tokens in %.2f ms",
         output.shape[0],
         merged.shape[0],
+        dpp_elapsed_ms,
     )
     return output
 
