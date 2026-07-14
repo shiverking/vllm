@@ -41,16 +41,18 @@ def test_sa_map_attention_weighted_merging():
     features = torch.tensor(
         [
             [1.0, 0.0],
-            [1.0, 0.0],
+            [0.8, 0.2],
             [0.0, 1.0],
-            [0.0, 1.0],
+            [-0.1, 0.99],
         ]
     )
     importance = torch.tensor([1.0, 3.0, 2.0, 2.0])
 
-    output = _sa_map_compress(features, importance, 2, 0.99)
+    output = _sa_map_compress(features, importance, 2, 0.9)
 
-    torch.testing.assert_close(output, torch.tensor([[1.0, 0.0], [0.0, 1.0]]))
+    torch.testing.assert_close(
+        output, torch.tensor([[0.85, 0.15], [-0.05, 0.995]])
+    )
 
 
 def test_sa_map_pruning_has_fixed_length_and_finite_output():

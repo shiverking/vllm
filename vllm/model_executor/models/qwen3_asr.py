@@ -22,6 +22,7 @@
 # limitations under the License.
 """Inference-only Qwen3-ASR model."""
 
+import time
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
@@ -164,29 +165,66 @@ def _sa_map_compress(
     )
     weights = weights.clamp_min(eps)
 
-    groups: list[torch.Tensor] = []
+    # G-SAM grouping is sequential because each candidate is compared with
+    # the current group. Doing that directly on an accelerator makes every
+    # Python branch synchronize a device scalar. Copy the small N x N
+    # similarity matrix once, then use row prefix sums for O(1) group-score
+    # queries on CPU.
+    grouping_start = time.perf_counter()
+    similarity_cpu = similarity.detach().to(device="cpu", dtype=torch.float32)
+    similarity_prefix = similarity_cpu.cumsum(dim=-1)
+
+    group_ranges: list[tuple[int, int]] = []
     start = 0
     while start < num_tokens:
         end = start + 1
         while end < num_tokens:
-            mean_similarity = similarity[end, start:end].mean()
+            similarity_sum = similarity_prefix[end, end - 1]
+            if start > 0:
+                similarity_sum = (
+                    similarity_sum - similarity_prefix[end, start - 1]
+                )
+            mean_similarity = similarity_sum / (end - start)
             if mean_similarity < similarity_threshold:
                 break
             end += 1
-        groups.append(torch.arange(start, end, device=features.device))
+        group_ranges.append((start, end))
         start = end
 
-    merged_features = []
-    merged_importance = []
-    for group in groups:
-        group_weights = weights[group]
-        merged_features.append(
-            (features[group] * group_weights[:, None].to(features.dtype)).sum(0)
-            / group_weights.sum().to(features.dtype)
-        )
-        merged_importance.append(group_weights.mean())
+    group_ids_cpu = torch.empty(num_tokens, dtype=torch.long)
+    group_counts_cpu = torch.empty(len(group_ranges), dtype=torch.float32)
+    for group_id, (group_start, group_end) in enumerate(group_ranges):
+        group_ids_cpu[group_start:group_end] = group_id
+        group_counts_cpu[group_id] = group_end - group_start
+    group_ids = group_ids_cpu.to(features.device)
+    logger.info(
+        "SA-MAP CPU grouping completed in %.2f ms for %d tokens",
+        (time.perf_counter() - grouping_start) * 1000,
+        num_tokens,
+    )
 
-    merged = torch.stack(merged_features)
+    merge_start = time.perf_counter()
+    num_groups = len(group_ranges)
+    weighted_features = features * weights[:, None].to(features.dtype)
+    feature_sums = torch.zeros(
+        (num_groups, features.shape[-1]),
+        device=features.device,
+        dtype=features.dtype,
+    )
+    feature_sums.index_add_(0, group_ids, weighted_features)
+
+    weight_sums = torch.zeros(
+        num_groups, device=features.device, dtype=weights.dtype
+    )
+    weight_sums.index_add_(0, group_ids, weights)
+    merged = feature_sums / weight_sums[:, None].to(features.dtype).clamp_min(eps)
+    group_counts = group_counts_cpu.to(features.device)
+    merged_importance = weight_sums / group_counts
+    logger.info(
+        "SA-MAP vectorized merge enqueued in %.2f ms for %d groups",
+        (time.perf_counter() - merge_start) * 1000,
+        num_groups,
+    )
     logger.info(
         "SA-MAP G-SAM grouped %d audio tokens into %d tokens "
         "(target=%d, threshold=%.3f)",
@@ -199,6 +237,10 @@ def _sa_map_compress(
         # A low threshold can over-merge. Split the largest temporal groups
         # until the fixed placeholder contract is met.
         if merged.shape[0] < target_length:
+            groups = [
+                torch.arange(start, end, device=features.device)
+                for start, end in group_ranges
+            ]
             limited = _sa_map_limit_merging(
                 features, weights, groups, target_length, eps
             )
@@ -211,7 +253,7 @@ def _sa_map_compress(
         logger.info("SA-MAP completed with merging only: %d tokens", target_length)
         return merged
 
-    relevance = torch.stack(merged_importance)
+    relevance = merged_importance
     merged_normalized = F.normalize(merged.float(), dim=-1, eps=eps)
     kernel = relevance[:, None] * (merged_normalized @ merged_normalized.T)
     kernel = kernel * relevance[None, :]
