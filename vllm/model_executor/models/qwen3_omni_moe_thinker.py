@@ -239,17 +239,6 @@ class Qwen3OmniMoeAudioAttention(nn.Module):
         k = k.view(1, seq_length, -1, self.head_dim)
         v = v.view(1, seq_length, -1, self.head_dim)
 
-        attention_cls = type(self.attn)
-        forward_method = getattr(self.attn, "_forward_method", None)
-        logger.info_once(
-            "[AUDIO_ENCODER_D2H_DEBUG] Runtime MMEncoderAttention class is "
-            "%s.%s; forward_method=%s.%s; sequence_lengths_is_none=%s",
-            attention_cls.__module__,
-            attention_cls.__name__,
-            getattr(forward_method, "__module__", None),
-            getattr(forward_method, "__name__", None),
-            sequence_lengths is None,
-        )
         attn_output = self.attn(
             query=q,
             key=k,
@@ -520,10 +509,6 @@ class Qwen3OmniMoeAudioEncoder(nn.Module):
                 cu_chunk_lens.append(remainder)
         sequence_lengths = torch.tensor(
             cu_chunk_lens[1:], dtype=torch.int32, device="cpu"
-        )
-        logger.info_once(
-            "[AUDIO_ENCODER_D2H] Prepared CPU sequence lengths for all "
-            "audio encoder layers."
         )
         cu_seqlens = async_tensor_h2d(
             cu_chunk_lens, dtype=torch.int32, device=aftercnn_lens.device
