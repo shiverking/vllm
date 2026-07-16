@@ -4,9 +4,58 @@
 from unittest.mock import Mock
 
 import pytest
+import torch
 from transformers import PretrainedConfig
 
 from vllm.multimodal.processing import InputProcessingContext
+
+
+def test_audio_encoder_sequence_lengths_propagation():
+    from vllm.model_executor.models.qwen3_omni_moe_thinker import (
+        Qwen3OmniMoeAudioAttention,
+        Qwen3OmniMoeAudioEncoderLayer,
+    )
+
+    sequence_lengths = torch.tensor([2, 3], dtype=torch.int32)
+    cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int32)
+    hidden_states = torch.randn(5, 8)
+
+    attention = Qwen3OmniMoeAudioAttention.__new__(Qwen3OmniMoeAudioAttention)
+    torch.nn.Module.__init__(attention)
+    attention.head_dim = 4
+    attention.qkv = Mock(return_value=(torch.randn(5, 24), None))
+    attention.attn = Mock(return_value=torch.randn(1, 5, 2, 4))
+    attention.out_proj = Mock(return_value=(torch.randn(5, 8), None))
+
+    attention(
+        hidden_states,
+        cu_seqlens,
+        max_seqlen=None,
+        sequence_lengths=sequence_lengths,
+    )
+    assert attention.attn.call_args.kwargs["sequence_lengths"] is sequence_lengths
+
+    encoder_layer = Qwen3OmniMoeAudioEncoderLayer.__new__(
+        Qwen3OmniMoeAudioEncoderLayer
+    )
+    torch.nn.Module.__init__(encoder_layer)
+    encoder_layer.self_attn_layer_norm = torch.nn.Identity()
+    encoder_layer.self_attn = Mock(return_value=torch.zeros_like(hidden_states))
+    encoder_layer.final_layer_norm = torch.nn.Identity()
+    encoder_layer.fc1 = Mock(return_value=(hidden_states, None))
+    encoder_layer.activation_fn = torch.nn.Identity()
+    encoder_layer.fc2 = Mock(return_value=(hidden_states, None))
+
+    encoder_layer(
+        hidden_states,
+        cu_seqlens,
+        max_seqlen=None,
+        sequence_lengths=sequence_lengths,
+    )
+    assert (
+        encoder_layer.self_attn.call_args.kwargs["sequence_lengths"]
+        is sequence_lengths
+    )
 
 
 # Helper function to print input IDs with coalesced audio/video tokens.

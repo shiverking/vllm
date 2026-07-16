@@ -230,6 +230,7 @@ class Qwen3OmniMoeAudioAttention(nn.Module):
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
         max_seqlen: torch.Tensor | None,
+        sequence_lengths: torch.Tensor | None = None,
     ) -> torch.Tensor:
         seq_length, _ = hidden_states.size()
         qkv, _ = self.qkv(hidden_states)
@@ -244,6 +245,7 @@ class Qwen3OmniMoeAudioAttention(nn.Module):
             value=v,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            sequence_lengths=sequence_lengths,
         )
 
         attn_output = attn_output.view(seq_length, -1)
@@ -285,6 +287,7 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
         max_seqlen: torch.Tensor | None,
+        sequence_lengths: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -298,6 +301,7 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
             hidden_states=hidden_states,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            sequence_lengths=sequence_lengths,
         )
         hidden_states = residual + hidden_states
 
@@ -503,6 +507,13 @@ class Qwen3OmniMoeAudioEncoder(nn.Module):
             cu_chunk_lens.extend([window_aftercnn] * num_full_chunks)
             if remainder:
                 cu_chunk_lens.append(remainder)
+        sequence_lengths = torch.tensor(
+            cu_chunk_lens[1:], dtype=torch.int32, device="cpu"
+        )
+        logger.info_once(
+            "[AUDIO_ENCODER_D2H] Prepared CPU sequence lengths for all "
+            "audio encoder layers."
+        )
         cu_seqlens = async_tensor_h2d(
             cu_chunk_lens, dtype=torch.int32, device=aftercnn_lens.device
         ).cumsum(-1, dtype=torch.int32)
@@ -515,6 +526,7 @@ class Qwen3OmniMoeAudioEncoder(nn.Module):
                 hidden_states,
                 cu_seqlens,
                 max_seqlen,
+                sequence_lengths=sequence_lengths,
             )
 
         # Apply output layers
