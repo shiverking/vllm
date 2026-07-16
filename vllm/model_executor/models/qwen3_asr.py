@@ -176,8 +176,12 @@ def _qwen3asr_field_config(hf_inputs: Mapping[str, torch.Tensor]):
         input_audio_features=MultiModalFieldConfig.flat_from_sizes(
             "audio", audio_feature_lengths, dim=1
         ),
-        feature_attention_mask=MultiModalFieldConfig.batched("audio"),
-        audio_feature_lengths=MultiModalFieldConfig.batched("audio"),
+        feature_attention_mask=MultiModalFieldConfig.batched(
+            "audio", keep_on_cpu=True
+        ),
+        audio_feature_lengths=MultiModalFieldConfig.batched(
+            "audio", keep_on_cpu=True
+        ),
     )
 
 

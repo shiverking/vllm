@@ -432,16 +432,20 @@ class Qwen3OmniMoeAudioEncoder(nn.Module):
         feature_lens: torch.Tensor,
         aftercnn_lens: torch.Tensor,
     ):
-        # Compute chunk information
-        chunk_num = torch.ceil(feature_lens / (self.n_window * 2)).long()
+        # Keep length and chunk metadata on CPU. Qwen3-ASR supplies CPU
+        # tensors; the conversion preserves compatibility with other callers.
+        feature_lens_cpu = feature_lens.to(device="cpu", dtype=torch.long)
+        aftercnn_lens_cpu = aftercnn_lens.to(device="cpu", dtype=torch.long)
+        chunk_num = torch.ceil(feature_lens_cpu / (self.n_window * 2)).long()
 
-        chunk_lengths = torch.tensor(
-            [self.n_window * 2] * chunk_num.sum(),
+        chunk_lengths = torch.full(
+            (int(chunk_num.sum()),),
+            self.n_window * 2,
             dtype=torch.long,
-            device=feature_lens.device,
+            device="cpu",
         )
         tail_chunk_index = F.pad(chunk_num, (1, 0), value=-1).cumsum(0)[1:]
-        chunk_lengths[tail_chunk_index] = feature_lens % (self.n_window * 2)
+        chunk_lengths[tail_chunk_index] = feature_lens_cpu % (self.n_window * 2)
         chunk_lengths[chunk_lengths == 0] = self.n_window * 2
 
         # Split input features into chunks and pad
@@ -450,13 +454,16 @@ class Qwen3OmniMoeAudioEncoder(nn.Module):
             chunk_list, batch_first=True
         ).transpose(1, 2)
 
-        # Compute feature lengths after CNN
+        # Compute feature lengths on CPU. Transfer only the compact length
+        # vector and construct the larger validity mask on the NPU.
         feature_lens_after_cnn = self._get_cnn_output_lengths(chunk_lengths)
-        # Vectorized mask creation: avoid creating many small tensors
-        max_len_after_cnn = feature_lens_after_cnn.max().item()
+        max_len_after_cnn = int(feature_lens_after_cnn.max())
+        feature_lens_after_cnn_device = feature_lens_after_cnn.to(
+            device=padded_feature.device, non_blocking=True
+        )
         indices = torch.arange(max_len_after_cnn, device=padded_feature.device)
-        padded_mask_after_cnn = indices.unsqueeze(0) < feature_lens_after_cnn.unsqueeze(
-            1
+        padded_mask_after_cnn = (
+            indices.unsqueeze(0) < feature_lens_after_cnn_device.unsqueeze(1)
         )
 
         # Add channel dimension for conv2d
@@ -501,7 +508,7 @@ class Qwen3OmniMoeAudioEncoder(nn.Module):
             self.n_window_infer // (self.n_window * 2)
         )
         # Use tolist() for efficient batch conversion from tensor to Python
-        for cnn_len in aftercnn_lens.tolist():
+        for cnn_len in aftercnn_lens_cpu.tolist():
             num_full_chunks = cnn_len // window_aftercnn
             remainder = cnn_len % window_aftercnn
             cu_chunk_lens.extend([window_aftercnn] * num_full_chunks)
@@ -511,7 +518,7 @@ class Qwen3OmniMoeAudioEncoder(nn.Module):
             cu_chunk_lens[1:], dtype=torch.int32, device="cpu"
         )
         cu_seqlens = async_tensor_h2d(
-            cu_chunk_lens, dtype=torch.int32, device=aftercnn_lens.device
+            cu_chunk_lens, dtype=torch.int32, device=hidden_states.device
         ).cumsum(-1, dtype=torch.int32)
 
         max_seqlen = self.compute_attn_mask_seqlen(cu_seqlens)
