@@ -220,6 +220,7 @@ def test_qwen3_omni_get_updates_use_audio_in_video(
     )
 
 
+@pytest.mark.skip_global_cleanup
 def test_audio_encoder_builds_cpu_sequence_lengths():
     from vllm.model_executor.models.qwen3_omni_moe_thinker import (
         Qwen3OmniMoeAudioEncoder,
@@ -230,7 +231,9 @@ def test_audio_encoder_builds_cpu_sequence_lengths():
         cu_chunk_lens
     )
     expected = torch.diff(
-        torch.tensor(cu_chunk_lens, dtype=torch.int32).cumsum(0)
+        torch.tensor(cu_chunk_lens, dtype=torch.int32).cumsum(
+            0, dtype=torch.int32
+        )
     )
 
     assert sequence_lengths.device.type == "cpu"
@@ -239,6 +242,7 @@ def test_audio_encoder_builds_cpu_sequence_lengths():
     torch.testing.assert_close(sequence_lengths, expected)
 
 
+@pytest.mark.skip_global_cleanup
 def test_audio_encoder_body_reuses_sequence_lengths_for_all_layers():
     from vllm.model_executor.models.qwen3_omni_moe_thinker import (
         Qwen3OmniMoeAudioEncoder,
