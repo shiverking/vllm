@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import torch
 from transformers import PretrainedConfig
 
 from vllm.multimodal.processing import InputProcessingContext
@@ -216,6 +218,59 @@ def test_qwen3_omni_get_updates_use_audio_in_video(
     assert len(updates) == expected_total, (
         f"Expected {expected_total} total tokens, got {len(updates)}"
     )
+
+
+def test_audio_encoder_builds_cpu_sequence_lengths():
+    from vllm.model_executor.models.qwen3_omni_moe_thinker import (
+        Qwen3OmniMoeAudioEncoder,
+    )
+
+    cu_chunk_lens = [0, 50, 50, 25]
+    sequence_lengths = Qwen3OmniMoeAudioEncoder._build_sequence_lengths(
+        cu_chunk_lens
+    )
+    expected = torch.diff(
+        torch.tensor(cu_chunk_lens, dtype=torch.int32).cumsum(0)
+    )
+
+    assert sequence_lengths.device.type == "cpu"
+    assert sequence_lengths.dtype == torch.int32
+    assert sequence_lengths.is_contiguous()
+    torch.testing.assert_close(sequence_lengths, expected)
+
+
+def test_audio_encoder_body_reuses_sequence_lengths_for_all_layers():
+    from vllm.model_executor.models.qwen3_omni_moe_thinker import (
+        Qwen3OmniMoeAudioEncoder,
+    )
+
+    seen_sequence_lengths = []
+
+    def layer_forward(hidden_states, cu_seqlens, max_seqlen, sequence_lengths):
+        seen_sequence_lengths.append(sequence_lengths)
+        return hidden_states
+
+    sequence_lengths = torch.tensor([50, 50, 25], dtype=torch.int32)
+    hidden_states = torch.randn(125, 8)
+    encoder = SimpleNamespace(
+        layers=[layer_forward for _ in range(4)],
+        ln_post=lambda x: x,
+        proj1=lambda x: x,
+        act=lambda x: x,
+        proj2=lambda x: x,
+    )
+
+    output = Qwen3OmniMoeAudioEncoder._forward_encoder_body(
+        encoder,
+        hidden_states,
+        torch.tensor([0, 50, 100, 125], dtype=torch.int32),
+        None,
+        sequence_lengths,
+    )
+
+    assert output is hidden_states
+    assert len(seen_sequence_lengths) == 4
+    assert all(value is sequence_lengths for value in seen_sequence_lengths)
 
 
 if __name__ == "__main__":

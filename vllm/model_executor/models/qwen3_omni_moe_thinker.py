@@ -230,6 +230,7 @@ class Qwen3OmniMoeAudioAttention(nn.Module):
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
         max_seqlen: torch.Tensor | None,
+        sequence_lengths: torch.Tensor | None = None,
     ) -> torch.Tensor:
         seq_length, _ = hidden_states.size()
         qkv, _ = self.qkv(hidden_states)
@@ -244,6 +245,7 @@ class Qwen3OmniMoeAudioAttention(nn.Module):
             value=v,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            sequence_lengths=sequence_lengths,
         )
 
         attn_output = attn_output.view(seq_length, -1)
@@ -285,6 +287,7 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
         max_seqlen: torch.Tensor | None,
+        sequence_lengths: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -298,6 +301,7 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
             hidden_states=hidden_states,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            sequence_lengths=sequence_lengths,
         )
         hidden_states = residual + hidden_states
 
@@ -325,6 +329,7 @@ class Qwen3OmniMoeAudioEncoder(nn.Module):
         self,
         config: Qwen3OmniMoeAudioEncoderConfig,
         prefix: str = "",
+        enforce_eager: bool = False,
     ):
         super().__init__()
 
@@ -334,6 +339,7 @@ class Qwen3OmniMoeAudioEncoder(nn.Module):
         self.n_window = config.n_window
         self.n_window_infer = config.n_window_infer
         self.conv_chunksize = config.conv_chunksize
+        self.enforce_eager = enforce_eager
 
         # Position embedding
         self.positional_embedding = SinusoidsPositionEmbedding(
@@ -422,6 +428,12 @@ class Qwen3OmniMoeAudioEncoder(nn.Module):
     def device(self) -> torch.device:
         return self.conv2d1.weight.device
 
+    @staticmethod
+    def _build_sequence_lengths(cu_chunk_lens: list[int]) -> torch.Tensor:
+        return torch.tensor(
+            cu_chunk_lens[1:], dtype=torch.int32, device="cpu"
+        ).contiguous()
+
     def forward(
         self,
         input_features: torch.Tensor,
@@ -503,18 +515,38 @@ class Qwen3OmniMoeAudioEncoder(nn.Module):
             cu_chunk_lens.extend([window_aftercnn] * num_full_chunks)
             if remainder:
                 cu_chunk_lens.append(remainder)
+        sequence_lengths = self._build_sequence_lengths(cu_chunk_lens)
         cu_seqlens = async_tensor_h2d(
             cu_chunk_lens, dtype=torch.int32, device=aftercnn_lens.device
         ).cumsum(-1, dtype=torch.int32)
 
         max_seqlen = self.compute_attn_mask_seqlen(cu_seqlens)
+        return self._forward_encoder_body(
+            hidden_states,
+            cu_seqlens,
+            max_seqlen,
+            sequence_lengths,
+            num_audios=aftercnn_lens.numel(),
+        )
 
-        # Apply transformer layers
+    def _forward_encoder_body(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: torch.Tensor | None,
+        sequence_lengths: torch.Tensor,
+        num_audios: int = 1,
+    ) -> torch.Tensor:
+        # num_audios is consumed by device-specific wrappers that specialize
+        # the encoder body. The native implementation remains batch agnostic.
+        del num_audios
+
         for encoder_layer in self.layers:
             hidden_states = encoder_layer(
                 hidden_states,
                 cu_seqlens,
                 max_seqlen,
+                sequence_lengths,
             )
 
         # Apply output layers
@@ -1725,6 +1757,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             self.audio_tower = Qwen3OmniMoeAudioEncoder(
                 thinker_config.audio_config,
                 prefix=maybe_prefix(prefix, "audio_tower"),
+                enforce_eager=vllm_config.model_config.enforce_eager,
             )
 
         self.use_deepstack = hasattr(

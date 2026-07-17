@@ -315,6 +315,7 @@ class Qwen3ASRForConditionalGeneration(
             self.audio_tower = Qwen3OmniMoeAudioEncoder(
                 thinker_config.audio_config,
                 prefix=maybe_prefix(prefix, "audio_tower"),
+                enforce_eager=vllm_config.model_config.enforce_eager,
             )
 
         with self._mark_language_model(vllm_config):
