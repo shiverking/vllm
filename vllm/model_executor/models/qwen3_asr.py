@@ -176,8 +176,12 @@ def _qwen3asr_field_config(hf_inputs: Mapping[str, torch.Tensor]):
         input_audio_features=MultiModalFieldConfig.flat_from_sizes(
             "audio", audio_feature_lengths, dim=1
         ),
-        feature_attention_mask=MultiModalFieldConfig.batched("audio"),
-        audio_feature_lengths=MultiModalFieldConfig.batched("audio"),
+        feature_attention_mask=MultiModalFieldConfig.batched(
+            "audio", keep_on_cpu=True
+        ),
+        audio_feature_lengths=MultiModalFieldConfig.batched(
+            "audio", keep_on_cpu=True
+        ),
     )
 
 
@@ -315,6 +319,7 @@ class Qwen3ASRForConditionalGeneration(
             self.audio_tower = Qwen3OmniMoeAudioEncoder(
                 thinker_config.audio_config,
                 prefix=maybe_prefix(prefix, "audio_tower"),
+                enforce_eager=vllm_config.model_config.enforce_eager,
             )
 
         with self._mark_language_model(vllm_config):
