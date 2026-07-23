@@ -529,7 +529,6 @@ class Qwen3OmniMoeAudioEncoder(nn.Module):
             cu_seqlens,
             max_seqlen,
             sequence_lengths,
-            num_audios=aftercnn_lens_cpu.numel(),
         )
 
     def _forward_encoder_body(
@@ -538,12 +537,7 @@ class Qwen3OmniMoeAudioEncoder(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: torch.Tensor | None,
         sequence_lengths: torch.Tensor,
-        num_audios: int = 1,
     ) -> torch.Tensor:
-        # num_audios is consumed by device-specific wrappers that specialize
-        # the encoder body. The native implementation remains batch agnostic.
-        del num_audios
-
         for encoder_layer in self.layers:
             hidden_states = encoder_layer(
                 hidden_states,
