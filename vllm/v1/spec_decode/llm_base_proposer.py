@@ -1136,6 +1136,36 @@ class SpecDecodeBaseProposer:
             model = model.module
         return model.__class__.__name__
 
+    def _maybe_set_image_token_index(self, target_model: nn.Module) -> None:
+        """Propagate an image token ID when the target has a vision input."""
+        target_config = target_model.config
+        target_model_name = self.get_model_name(target_model)
+
+        if target_model_name in [
+            "Cohere2VisionForConditionalGeneration",
+            "Exaone4_5_ForConditionalGeneration",
+            "GlmOcrForConditionalGeneration",
+            "HunYuanVLForConditionalGeneration",
+            "InternS2PreviewForConditionalGeneration",
+            "MiMoV2OmniForCausalLM",
+            "Qwen2_5_VLForConditionalGeneration",
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5MoeForConditionalGeneration",
+            "Qwen3VLForConditionalGeneration",
+            "Qwen3VLMoeForConditionalGeneration",
+            "Gemma4ForConditionalGeneration",
+        ]:
+            image_token_index = target_config.image_token_id
+        elif target_model_name == "PixtralForConditionalGeneration":
+            image_token_index = target_config.vision_config.image_token_id
+        elif target_model_name == "KimiK25ForConditionalGeneration":
+            image_token_index = target_config.media_placeholder_token_id
+        else:
+            image_token_index = getattr(target_config, "image_token_index", None)
+
+        if image_token_index is not None:
+            self.model.config.image_token_index = image_token_index
+
     def _create_draft_vllm_config(self) -> VllmConfig:
         """Return a VllmConfig with kernel-level overrides for the proposer.
         Subclasses may override to apply additional config changes.
@@ -1219,33 +1249,7 @@ class SpecDecodeBaseProposer:
         if supports_multimodal(target_model):
             # handle multimodality
             assert hasattr(target_model, "config")
-            if self.get_model_name(target_model) in [
-                "Cohere2VisionForConditionalGeneration",
-                "Exaone4_5_ForConditionalGeneration",
-                "GlmOcrForConditionalGeneration",
-                "HunYuanVLForConditionalGeneration",
-                "InternS2PreviewForConditionalGeneration",
-                "MiMoV2OmniForCausalLM",
-                "Qwen2_5_VLForConditionalGeneration",
-                "Qwen3_5ForConditionalGeneration",
-                "Qwen3_5MoeForConditionalGeneration",
-                "Qwen3VLForConditionalGeneration",
-                "Qwen3VLMoeForConditionalGeneration",
-                "Gemma4ForConditionalGeneration",
-            ]:
-                self.model.config.image_token_index = target_model.config.image_token_id
-            elif self.get_model_name(target_model) == "PixtralForConditionalGeneration":
-                self.model.config.image_token_index = (
-                    target_model.config.vision_config.image_token_id
-                )
-            elif self.get_model_name(target_model) == "KimiK25ForConditionalGeneration":
-                self.model.config.image_token_index = (
-                    target_model.config.media_placeholder_token_id
-                )
-            else:
-                self.model.config.image_token_index = (
-                    target_model.config.image_token_index
-                )
+            self._maybe_set_image_token_index(target_model)
             target_language_model = cast(
                 SupportsMultiModal, target_model
             ).get_language_model()
