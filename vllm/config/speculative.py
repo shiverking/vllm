@@ -44,6 +44,7 @@ MTPModelTypes = Literal[
     "exaone4_5_mtp",
     "qwen3_next_mtp",
     "qwen3_5_mtp",
+    "qwen3_asr_mtp",
     "longcat_flash_mtp",
     "mtp",
     "pangu_ultra_moe_mtp",
@@ -300,6 +301,22 @@ class SpeculativeConfig:
     @staticmethod
     def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
         initial_architecture = hf_config.architectures[0]
+        if hf_config.model_type == "qwen3_asr":
+            n_predict = getattr(hf_config, "mtp_num_hidden_layers", None)
+            if not isinstance(n_predict, int) or n_predict < 1:
+                raise ValueError(
+                    "Qwen3-ASR MTP requires a positive mtp_num_hidden_layers "
+                    "in the target config"
+                )
+            hf_config = copy.deepcopy(hf_config.thinker_config.text_config)
+            hf_config.model_type = "qwen3_asr_mtp"
+            hf_config.update(
+                {
+                    "n_predict": n_predict,
+                    "mtp_num_hidden_layers": n_predict,
+                    "architectures": ["Qwen3ASRMTP"],
+                }
+            )
         if hf_config.model_type in (
             "deepseek_v3",
             "deepseek_v32",
@@ -705,7 +722,10 @@ class SpeculativeConfig:
                     MTPModelTypes
                 ):
                     self.method = "mtp"
-                    if self.num_speculative_tokens > 1:
+                    if (
+                        self.num_speculative_tokens > 1
+                        and getattr(self.draft_model_config.hf_config, "n_predict", 1) == 1
+                    ):
                         logger.warning(
                             "Enabling num_speculative_tokens > 1 will run "
                             "multiple times of forward on same MTP layer"
@@ -766,6 +786,15 @@ class SpeculativeConfig:
                     if self.num_speculative_tokens is None:
                         # Default to max value defined in draft model config.
                         self.num_speculative_tokens = n_predict
+                    elif (
+                        self.num_speculative_tokens > n_predict
+                        and self.draft_model_config.hf_config.model_type
+                        == "qwen3_asr_mtp"
+                    ):
+                        raise ValueError(
+                            f"num_speculative_tokens:{self.num_speculative_tokens} "
+                            f"must not exceed trained Qwen3-ASR MTP depth {n_predict}"
+                        )
                     elif (
                         self.num_speculative_tokens > n_predict
                         and self.num_speculative_tokens % n_predict != 0

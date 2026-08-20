@@ -421,6 +421,12 @@ class SpecDecodeBaseProposer:
         logits = self.model.compute_logits(hidden_states)
         return self._sample_from_logits(logits, sampling_metadata)
 
+    def _uses_serial_mtp_layers(self) -> bool:
+        return (
+            self.method == "mtp"
+            and self.draft_model_config.hf_config.model_type == "qwen3_asr_mtp"
+        )
+
     def take_last_draft_probs(self) -> torch.Tensor | None:
         return self._last_draft_probs
 
@@ -612,6 +618,8 @@ class SpecDecodeBaseProposer:
             }
             if self.pass_hidden_states_to_model:
                 model_kwargs["hidden_states"] = self.hidden_states[:input_batch_size]
+            if self._uses_serial_mtp_layers():
+                model_kwargs["spec_step_idx"] = token_index
 
             with set_forward_context(
                 per_layer_attn_metadata,
@@ -1497,6 +1505,8 @@ class SpecDecodeBaseProposer:
                 )
                 if self.pass_hidden_states_to_model:
                     kwargs["hidden_states"] = self.hidden_states[:num_input_tokens]
+                if self._uses_serial_mtp_layers():
+                    kwargs["spec_step_idx"] = fwd_idx
                 self.model(**kwargs)
 
     def _get_eagle3_use_aux_hidden_state_from_config(self) -> bool:

@@ -453,6 +453,7 @@ class Qwen3ASRForConditionalGeneration(
         loader = AutoWeightsLoader(
             self,
             skip_prefixes=["talker.", "code2wav."],
+            ignore_unexpected_prefixes=["mtp."],
         )
         loaded_weights = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
