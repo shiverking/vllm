@@ -735,8 +735,10 @@ class SpeculativeConfig:
                     # config. Use the already validated target config as the
                     # source of truth and refresh every architecture cache used
                     # by the draft runner.
-                    self.draft_model_config.hf_config = self.hf_config_override(
-                        self.target_model_config.hf_config
+                    self.draft_model_config.hf_config = (
+                        SpeculativeConfig.hf_config_override(
+                            self.target_model_config.hf_config
+                        )
                     )
                     self.draft_model_config.encoder_config = None
                     self.draft_model_config.hf_image_processor_config = None
@@ -749,7 +751,7 @@ class SpeculativeConfig:
                     self.update_arch_()
                     logger.info(
                         "Re-resolved Qwen3-ASR MTP draft architecture: %s",
-                        self.draft_model_config.architectures[0],
+                        self.draft_model_config.hf_config.architectures[0],
                     )
 
                 # Automatically detect the method
