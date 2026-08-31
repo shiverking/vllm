@@ -300,6 +300,34 @@ class SpeculativeConfig:
         return hash_str
 
     @staticmethod
+    def _build_qwen3_asr_mtp_config(
+        text_config: PretrainedConfig,
+        n_predict: Any,
+        branch_position_mode: Any,
+    ) -> PretrainedConfig:
+        if not isinstance(n_predict, int) or n_predict < 1:
+            raise ValueError(
+                "Qwen3-ASR MTP requires a positive mtp_num_hidden_layers "
+                "in the target config"
+            )
+        if branch_position_mode not in {"base", "shifted"}:
+            raise ValueError(
+                "Qwen3-ASR MTP requires mtp_branch_position_mode to be "
+                f"'base' or 'shifted', got {branch_position_mode!r}"
+            )
+        draft_config = copy.deepcopy(text_config)
+        draft_config.model_type = "qwen3_asr_mtp"
+        draft_config.update(
+            {
+                "n_predict": n_predict,
+                "mtp_num_hidden_layers": n_predict,
+                "mtp_branch_position_mode": branch_position_mode,
+                "architectures": ["Qwen3ASRMTP"],
+            }
+        )
+        return draft_config
+
+    @staticmethod
     def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
         initial_architecture = hf_config.architectures[0]
         n_predict = getattr(hf_config, "mtp_num_hidden_layers", None)
@@ -308,38 +336,20 @@ class SpeculativeConfig:
             and isinstance(n_predict, int)
         )
         if is_qwen3_asr_mtp:
-            if not isinstance(n_predict, int) or n_predict < 1:
-                raise ValueError(
-                    "Qwen3-ASR MTP requires a positive mtp_num_hidden_layers "
-                    "in the target config"
-                )
             branch_position_mode = getattr(
                 hf_config, "mtp_branch_position_mode", "shifted"
             )
-            if branch_position_mode not in {"base", "shifted"}:
-                raise ValueError(
-                    "Qwen3-ASR MTP requires mtp_branch_position_mode to be "
-                    f"'base' or 'shifted', got {branch_position_mode!r}"
-                )
             thinker_config = getattr(hf_config, "thinker_config", None)
             text_config = getattr(thinker_config, "text_config", None)
             if text_config is None:
                 text_config = getattr(hf_config, "text_config", None)
-            if text_config is not None:
-                hf_config = copy.deepcopy(text_config)
-            else:
+            if text_config is None:
                 # Some config-parser paths instantiate the composite on-disk
                 # config as its text config class while preserving the target
                 # architecture and exported MTP fields.
-                hf_config = copy.deepcopy(hf_config)
-            hf_config.model_type = "qwen3_asr_mtp"
-            hf_config.update(
-                {
-                    "n_predict": n_predict,
-                    "mtp_num_hidden_layers": n_predict,
-                    "mtp_branch_position_mode": branch_position_mode,
-                    "architectures": ["Qwen3ASRMTP"],
-                }
+                text_config = hf_config
+            hf_config = SpeculativeConfig._build_qwen3_asr_mtp_config(
+                text_config, n_predict, branch_position_mode
             )
         if hf_config.model_type in (
             "deepseek_v3",
@@ -744,21 +754,14 @@ class SpeculativeConfig:
                             "Qwen3-ASR MTP requires a readable config.json "
                             "in the shared target/draft checkpoint"
                         )
-                    repair_source_config = copy.deepcopy(
-                        self.target_model_config.hf_config
-                    )
-                    repair_source_config.update(
-                        {
-                            "mtp_num_hidden_layers": checkpoint_config.get(
-                                "mtp_num_hidden_layers"
-                            ),
-                            "mtp_branch_position_mode": checkpoint_config.get(
+                    self.draft_model_config.hf_config = (
+                        SpeculativeConfig._build_qwen3_asr_mtp_config(
+                            self.target_model_config.hf_text_config,
+                            checkpoint_config.get("mtp_num_hidden_layers"),
+                            checkpoint_config.get(
                                 "mtp_branch_position_mode", "shifted"
                             ),
-                        }
-                    )
-                    self.draft_model_config.hf_config = (
-                        SpeculativeConfig.hf_config_override(repair_source_config)
+                        )
                     )
                     self.draft_model_config.encoder_config = None
                     self.draft_model_config.hf_image_processor_config = None
