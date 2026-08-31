@@ -21,6 +21,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.qwen3 import Qwen3DecoderLayer
 from vllm.model_executor.models.utils import PPMissingLayer, maybe_prefix
+from vllm.multimodal.inputs import NestedTensors
 from vllm.sequence import IntermediateTensors
 
 
@@ -159,7 +160,14 @@ class Qwen3ASRMTP(nn.Module):
             self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
 
-    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def embed_input_ids(
+        self,
+        input_ids: torch.Tensor,
+        multimodal_embeddings: NestedTensors | None = None,
+        is_multimodal: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # Audio embeddings are consumed by the target during prefill. The MTP
+        # draft only embeds text tokens and conditions on target hidden states.
         return self.model.embed_input_ids(input_ids)
 
     def forward(

@@ -266,6 +266,26 @@ def test_qwen3_asr_mtp_skips_redundant_tied_lm_head_weight():
     assert torch.equal(mtp.model.embed_tokens.weight, embedding_weight)
 
 
+def test_qwen3_asr_mtp_embed_input_ids_accepts_multimodal_runner_args():
+    mtp = Qwen3ASRMTP.__new__(Qwen3ASRMTP)
+    nn.Module.__init__(mtp)
+    mtp.model = Qwen3ASRMultiTokenPredictor.__new__(
+        Qwen3ASRMultiTokenPredictor
+    )
+    nn.Module.__init__(mtp.model)
+    mtp.model.embed_tokens = nn.Embedding(8, 4)
+    input_ids = torch.tensor([1, 2])
+
+    expected = mtp.model.embed_input_ids(input_ids)
+    actual = mtp.embed_input_ids(
+        input_ids,
+        multimodal_embeddings=(torch.randn(2, 4),),
+        is_multimodal=torch.tensor([True, True]),
+    )
+
+    assert torch.equal(actual, expected)
+
+
 def test_qwen3_asr_audio_conv_initializes_on_meta(monkeypatch):
     reset_devices = []
     original_reset_parameters = nn.Conv2d.reset_parameters
