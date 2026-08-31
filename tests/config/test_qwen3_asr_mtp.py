@@ -123,7 +123,10 @@ def test_qwen3_asr_mtp_override_through_hf_config_parser(tmp_path):
 
 
 def test_qwen3_asr_spec_config_repairs_composite_draft_model_config():
-    target_hf_config = _qwen3_asr_config(5)
+    # Qwen3-ASR's Transformers config class can discard exported MTP fields
+    # while constructing the target config. The repair must recover them from
+    # the checkpoint's raw config.json rather than from this parsed object.
+    target_hf_config = _qwen3_asr_config(None)
     target_model_config = SimpleNamespace(
         architectures=["Qwen3ASRForConditionalGeneration"],
         hf_config=target_hf_config,
@@ -154,6 +157,7 @@ def test_qwen3_asr_spec_config_repairs_composite_draft_model_config():
         hf_image_processor_config=object(),
         multimodal_config=object(),
         attention_chunk_size=None,
+        verify_with_parallel_config=lambda _: None,
     )
 
     def refresh_architecture(spec_config):
@@ -168,6 +172,13 @@ def test_qwen3_asr_spec_config_repairs_composite_draft_model_config():
         patch(
             "vllm.config.speculative.ModelConfig",
             return_value=incorrectly_parsed_draft,
+        ),
+        patch(
+            "vllm.config.speculative.get_hf_file_to_dict",
+            return_value={
+                "mtp_num_hidden_layers": 5,
+                "mtp_branch_position_mode": "base",
+            },
         ),
         patch.object(
             SpeculativeConfig,

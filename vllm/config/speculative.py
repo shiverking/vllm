@@ -14,6 +14,7 @@ from vllm.config.parallel import ParallelConfig
 from vllm.config.utils import config
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_text_config
+from vllm.transformers_utils.repo_utils import get_hf_file_to_dict
 from vllm.utils.hashing import safe_hash
 from vllm.utils.import_utils import LazyLoader, has_arctic_inference
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -732,13 +733,32 @@ class SpeculativeConfig:
                     # checkpoint. Re-loading it through ModelConfig can resolve
                     # the draft as the target architecture even though the HF
                     # override itself correctly returns the text-only MTP
-                    # config. Use the already validated target config as the
-                    # source of truth and refresh every architecture cache used
-                    # by the draft runner.
-                    self.draft_model_config.hf_config = (
-                        SpeculativeConfig.hf_config_override(
-                            self.target_model_config.hf_config
+                    # config. Recover exported MTP metadata from the raw file,
+                    # then refresh every architecture cache used by the draft
+                    # runner.
+                    checkpoint_config = get_hf_file_to_dict(
+                        "config.json", self.model, self.revision
+                    )
+                    if not isinstance(checkpoint_config, dict):
+                        raise ValueError(
+                            "Qwen3-ASR MTP requires a readable config.json "
+                            "in the shared target/draft checkpoint"
                         )
+                    repair_source_config = copy.deepcopy(
+                        self.target_model_config.hf_config
+                    )
+                    repair_source_config.update(
+                        {
+                            "mtp_num_hidden_layers": checkpoint_config.get(
+                                "mtp_num_hidden_layers"
+                            ),
+                            "mtp_branch_position_mode": checkpoint_config.get(
+                                "mtp_branch_position_mode", "shifted"
+                            ),
+                        }
+                    )
+                    self.draft_model_config.hf_config = (
+                        SpeculativeConfig.hf_config_override(repair_source_config)
                     )
                     self.draft_model_config.encoder_config = None
                     self.draft_model_config.hf_image_processor_config = None
