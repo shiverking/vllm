@@ -15,6 +15,9 @@ from vllm.model_executor.models.qwen3_asr_mtp import (
     Qwen3ASRMultiTokenPredictor,
     remap_qwen3_asr_mtp_weight_name,
 )
+from vllm.model_executor.models.qwen3_omni_moe_thinker import (
+    _create_conv2d_without_parameter_init,
+)
 from vllm.transformers_utils.config import get_config
 
 
@@ -217,6 +220,22 @@ def test_qwen3_asr_spec_config_repairs_composite_draft_model_config():
 def test_qwen3_asr_mtp_config_requires_trained_depth():
     with pytest.raises(ValueError, match="mtp_num_hidden_layers"):
         SpeculativeConfig.hf_config_override(_qwen3_asr_config(None))
+
+
+def test_qwen3_asr_audio_conv_initializes_on_meta(monkeypatch):
+    reset_devices = []
+    original_reset_parameters = nn.Conv2d.reset_parameters
+
+    def track_reset_device(module):
+        reset_devices.append(module.weight.device.type)
+        original_reset_parameters(module)
+
+    monkeypatch.setattr(nn.Conv2d, "reset_parameters", track_reset_device)
+
+    conv = _create_conv2d_without_parameter_init(1, 4, 3, 2, padding=1)
+
+    assert reset_devices == ["meta"]
+    assert conv.weight.device.type == torch.get_default_device().type
 
 
 @pytest.mark.parametrize(

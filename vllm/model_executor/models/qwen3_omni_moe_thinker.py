@@ -113,6 +113,12 @@ from .vision import get_vit_attn_backend
 
 logger = init_logger(__name__)
 
+
+def _create_conv2d_without_parameter_init(*args: Any, **kwargs: Any) -> nn.Conv2d:
+    """Allocate a Conv2d without running random initialization on the device."""
+    kwargs.setdefault("device", torch.get_default_device())
+    return torch.nn.utils.skip_init(nn.Conv2d, *args, **kwargs)
+
 # Speech input languages supported by Qwen3-Omni
 # From: https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct
 ISO639_1_SUPPORTED_LANGS = {
@@ -347,15 +353,17 @@ class Qwen3OmniMoeAudioEncoder(nn.Module):
         )
 
         # Convolutional layers for mel-spectrogram processing
-        self.conv2d1 = nn.Conv2d(1, config.downsample_hidden_size, 3, 2, padding=1)
-        self.conv2d2 = nn.Conv2d(
+        self.conv2d1 = _create_conv2d_without_parameter_init(
+            1, config.downsample_hidden_size, 3, 2, padding=1
+        )
+        self.conv2d2 = _create_conv2d_without_parameter_init(
             config.downsample_hidden_size,
             config.downsample_hidden_size,
             3,
             2,
             padding=1,
         )
-        self.conv2d3 = nn.Conv2d(
+        self.conv2d3 = _create_conv2d_without_parameter_init(
             config.downsample_hidden_size,
             config.downsample_hidden_size,
             3,
