@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -118,6 +120,87 @@ def test_qwen3_asr_mtp_override_through_hf_config_parser(tmp_path):
     assert draft.architectures == ["Qwen3ASRMTP"]
     assert draft.mtp_num_hidden_layers == 5
     assert draft.mtp_branch_position_mode == "base"
+
+
+def test_qwen3_asr_spec_config_repairs_composite_draft_model_config():
+    target_hf_config = _qwen3_asr_config(5)
+    target_model_config = SimpleNamespace(
+        architectures=["Qwen3ASRForConditionalGeneration"],
+        hf_config=target_hf_config,
+        hf_text_config=target_hf_config.thinker_config.text_config,
+        model="checkpoint",
+        tokenizer="checkpoint",
+        tokenizer_mode="auto",
+        trust_remote_code=False,
+        allowed_local_media_path="",
+        allowed_media_domains=None,
+        dtype=torch.bfloat16,
+        seed=0,
+        revision=None,
+        code_revision=None,
+        tokenizer_revision=None,
+        max_model_len=8192,
+        quantization=None,
+        enforce_eager=True,
+        max_logprobs=20,
+        config_format="auto",
+    )
+    target_parallel_config = SimpleNamespace(tensor_parallel_size=1)
+    incorrectly_parsed_draft = SimpleNamespace(
+        model="checkpoint",
+        hf_config=target_hf_config,
+        max_model_len=65536,
+        encoder_config=object(),
+        hf_image_processor_config=object(),
+        multimodal_config=object(),
+        attention_chunk_size=None,
+    )
+
+    def refresh_architecture(spec_config):
+        spec_config.draft_model_config.hf_text_config = (
+            spec_config.draft_model_config.hf_config
+        )
+        spec_config.draft_model_config.model_arch_config = SimpleNamespace(
+            architectures=spec_config.draft_model_config.hf_config.architectures
+        )
+
+    with (
+        patch(
+            "vllm.config.speculative.ModelConfig",
+            return_value=incorrectly_parsed_draft,
+        ),
+        patch.object(
+            SpeculativeConfig,
+            "update_arch_",
+            refresh_architecture,
+        ),
+        patch.object(
+            SpeculativeConfig,
+            "_verify_and_get_draft_tp",
+            return_value=1,
+        ),
+        patch.object(
+            SpeculativeConfig,
+            "create_draft_parallel_config",
+            return_value=target_parallel_config,
+        ),
+        patch.object(
+            SpeculativeConfig,
+            "_maybe_override_draft_max_model_len",
+            return_value=8192,
+        ),
+    ):
+        config = SpeculativeConfig(
+            method="mtp",
+            num_speculative_tokens=5,
+            target_model_config=target_model_config,
+            target_parallel_config=target_parallel_config,
+        )
+
+    assert config.draft_model_config.hf_config.model_type == "qwen3_asr_mtp"
+    assert config.draft_model_config.hf_config.architectures == ["Qwen3ASRMTP"]
+    assert config.draft_model_config.encoder_config is None
+    assert config.draft_model_config.multimodal_config is None
 
 
 def test_qwen3_asr_mtp_config_requires_trained_depth():

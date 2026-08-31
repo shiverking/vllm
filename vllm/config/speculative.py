@@ -723,6 +723,34 @@ class SpeculativeConfig:
                     hf_overrides=SpeculativeConfig.hf_config_override,
                     config_format=self.target_model_config.config_format,
                 )
+                if (
+                    self.method == "mtp"
+                    and "Qwen3ASRForConditionalGeneration"
+                    in self.target_model_config.architectures
+                ):
+                    # The target and Qwen3-ASR MTP weights share one composite
+                    # checkpoint. Re-loading it through ModelConfig can resolve
+                    # the draft as the target architecture even though the HF
+                    # override itself correctly returns the text-only MTP
+                    # config. Use the already validated target config as the
+                    # source of truth and refresh every architecture cache used
+                    # by the draft runner.
+                    self.draft_model_config.hf_config = self.hf_config_override(
+                        self.target_model_config.hf_config
+                    )
+                    self.draft_model_config.encoder_config = None
+                    self.draft_model_config.hf_image_processor_config = None
+                    self.draft_model_config.multimodal_config = None
+                    self.draft_model_config.attention_chunk_size = getattr(
+                        self.draft_model_config.hf_config,
+                        "attention_chunk_size",
+                        None,
+                    )
+                    self.update_arch_()
+                    logger.info(
+                        "Re-resolved Qwen3-ASR MTP draft architecture: %s",
+                        self.draft_model_config.architectures[0],
+                    )
 
                 # Automatically detect the method
                 if self.method in ("eagle", "eagle3", "dflash"):
