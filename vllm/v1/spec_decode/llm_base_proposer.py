@@ -83,6 +83,11 @@ class SpecDecodeBaseProposer:
         # shape (T, hc_mult * hidden_size). Expand the hidden_states buffer
         # so target_hidden_states fits; detect DeepseekV4 via draft hf_config.
         draft_hf_config = self.draft_model_config.hf_config
+        self.qwen3_asr_mtp_uses_base_positions = (
+            draft_hf_config.model_type == "qwen3_asr_mtp"
+            and getattr(draft_hf_config, "mtp_branch_position_mode", "shifted")
+            == "base"
+        )
         if hasattr(draft_hf_config, "compress_ratios") and hasattr(
             draft_hf_config, "hc_mult"
         ):
@@ -553,6 +558,13 @@ class SpecDecodeBaseProposer:
         cudagraph_runtime_mode, input_batch_size, batch_size_across_dp = (
             self._determine_batch_execution_and_padding(batch_size)
         )
+        base_mtp_model_positions = None
+        if self.qwen3_asr_mtp_uses_base_positions:
+            # Preserve one padded model-input tensor for all serial branches.
+            # The regular positions buffer remains free to advance logical KV
+            # positions without allocating a clone in every draft iteration.
+            base_mtp_model_positions = self._get_positions(input_batch_size).clone()
+            base_mtp_model_positions[:batch_size] = positions
 
         common_attn_metadata.num_actual_tokens = batch_size
         common_attn_metadata.max_query_len = 1
@@ -613,13 +625,18 @@ class SpecDecodeBaseProposer:
             # Run the model.
             model_kwargs = {
                 "input_ids": input_ids,
-                "positions": self._get_positions(input_batch_size),
+                "positions": (
+                    base_mtp_model_positions
+                    if base_mtp_model_positions is not None
+                    else self._get_positions(input_batch_size)
+                ),
                 "inputs_embeds": inputs_embeds,
             }
             if self.pass_hidden_states_to_model:
                 model_kwargs["hidden_states"] = self.hidden_states[:input_batch_size]
             if self._uses_serial_mtp_layers():
-                model_kwargs["spec_step_idx"] = token_index
+                # The first pass already consumed serial branch 0.
+                model_kwargs["spec_step_idx"] = token_index + 1
 
             with set_forward_context(
                 per_layer_attn_metadata,

@@ -13,7 +13,9 @@ from vllm.model_executor.models.qwen3_asr_mtp import (
 )
 
 
-def _qwen3_asr_config(depth: int | None) -> PretrainedConfig:
+def _qwen3_asr_config(
+    depth: int | None, position_mode: str = "base"
+) -> PretrainedConfig:
     text_config = PretrainedConfig(
         vocab_size=32,
         hidden_size=16,
@@ -30,6 +32,7 @@ def _qwen3_asr_config(depth: int | None) -> PretrainedConfig:
     config.model_type = "qwen3_asr"
     if depth is not None:
         config.mtp_num_hidden_layers = depth
+    config.mtp_branch_position_mode = position_mode
     return config
 
 
@@ -39,6 +42,23 @@ def test_qwen3_asr_mtp_draft_config_promotes_text_config():
     assert draft.architectures == ["Qwen3ASRMTP"]
     assert draft.n_predict == 3
     assert draft.mtp_num_hidden_layers == 3
+    assert draft.mtp_branch_position_mode == "base"
+
+
+def test_qwen3_asr_mtp5_draft_config_preserves_depth_and_position_mode():
+    draft = SpeculativeConfig.hf_config_override(
+        _qwen3_asr_config(5, position_mode="shifted")
+    )
+    assert draft.n_predict == 5
+    assert draft.mtp_num_hidden_layers == 5
+    assert draft.mtp_branch_position_mode == "shifted"
+
+
+def test_qwen3_asr_mtp_config_rejects_unknown_position_mode():
+    with pytest.raises(ValueError, match="mtp_branch_position_mode"):
+        SpeculativeConfig.hf_config_override(
+            _qwen3_asr_config(5, position_mode="unknown")
+        )
 
 
 def test_qwen3_asr_mtp_config_requires_trained_depth():
@@ -72,13 +92,14 @@ class _FakeMTPBlock(nn.Module):
         return torch.full_like(previous_hidden_states, self.value)
 
 
-def test_qwen3_asr_mtp_selects_serial_branch_by_spec_step():
+@pytest.mark.parametrize("spec_step_idx", range(5))
+def test_qwen3_asr_mtp5_selects_serial_branch_by_spec_step(spec_step_idx: int):
     predictor = Qwen3ASRMultiTokenPredictor.__new__(Qwen3ASRMultiTokenPredictor)
     nn.Module.__init__(predictor)
-    predictor.num_mtp_layers = 3
+    predictor.num_mtp_layers = 5
     predictor.embed_tokens = nn.Embedding(8, 4)
     predictor.layers = nn.ModuleList(
-        [_FakeMTPBlock(1.0), _FakeMTPBlock(2.0), _FakeMTPBlock(3.0)]
+        [_FakeMTPBlock(float(index)) for index in range(1, 6)]
     )
     predictor.norm = nn.Identity()
     input_ids = torch.tensor([1])
@@ -88,7 +109,9 @@ def test_qwen3_asr_mtp_selects_serial_branch_by_spec_step():
         input_ids,
         torch.tensor([0]),
         hidden_states,
-        spec_step_idx=2,
+        spec_step_idx=spec_step_idx,
     )
 
-    assert torch.equal(output, torch.full_like(hidden_states, 3.0))
+    assert torch.equal(
+        output, torch.full_like(hidden_states, float(spec_step_idx + 1))
+    )

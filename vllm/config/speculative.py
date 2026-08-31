@@ -308,12 +308,21 @@ class SpeculativeConfig:
                     "Qwen3-ASR MTP requires a positive mtp_num_hidden_layers "
                     "in the target config"
                 )
+            branch_position_mode = getattr(
+                hf_config, "mtp_branch_position_mode", "shifted"
+            )
+            if branch_position_mode not in {"base", "shifted"}:
+                raise ValueError(
+                    "Qwen3-ASR MTP requires mtp_branch_position_mode to be "
+                    f"'base' or 'shifted', got {branch_position_mode!r}"
+                )
             hf_config = copy.deepcopy(hf_config.thinker_config.text_config)
             hf_config.model_type = "qwen3_asr_mtp"
             hf_config.update(
                 {
                     "n_predict": n_predict,
                     "mtp_num_hidden_layers": n_predict,
+                    "mtp_branch_position_mode": branch_position_mode,
                     "architectures": ["Qwen3ASRMTP"],
                 }
             )
