@@ -200,6 +200,8 @@ class Qwen3ASRMTP(nn.Module):
             name = remap_qwen3_asr_mtp_weight_name(checkpoint_name)
             if name is None or "rotary_emb.inv_freq" in name:
                 continue
+            if self.config.tie_word_embeddings and name == "lm_head.weight":
+                continue
             for packed_name, source_name, shard_id in stacked_params_mapping:
                 if source_name not in name:
                     continue

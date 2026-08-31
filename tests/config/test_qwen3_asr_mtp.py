@@ -12,6 +12,7 @@ from transformers import PretrainedConfig
 
 from vllm.config.speculative import SpeculativeConfig
 from vllm.model_executor.models.qwen3_asr_mtp import (
+    Qwen3ASRMTP,
     Qwen3ASRMultiTokenPredictor,
     _get_qwen3_asr_mtp_config,
     remap_qwen3_asr_mtp_weight_name,
@@ -242,6 +243,27 @@ def test_qwen3_asr_mtp_model_uses_text_only_draft_config():
     )
 
     assert _get_qwen3_asr_mtp_config(vllm_config) is draft_config
+
+
+def test_qwen3_asr_mtp_skips_redundant_tied_lm_head_weight():
+    mtp = Qwen3ASRMTP.__new__(Qwen3ASRMTP)
+    nn.Module.__init__(mtp)
+    mtp.config = SimpleNamespace(tie_word_embeddings=True)
+    mtp.model = nn.Module()
+    mtp.model.embed_tokens = nn.Embedding(4, 3)
+    mtp.lm_head = mtp.model.embed_tokens
+    embedding_weight = torch.full_like(mtp.model.embed_tokens.weight, 2.0)
+    redundant_lm_head_weight = torch.full_like(embedding_weight, 3.0)
+
+    loaded = mtp.load_weights(
+        [
+            ("thinker.model.embed_tokens.weight", embedding_weight),
+            ("thinker.lm_head.weight", redundant_lm_head_weight),
+        ]
+    )
+
+    assert loaded == {"model.embed_tokens.weight"}
+    assert torch.equal(mtp.model.embed_tokens.weight, embedding_weight)
 
 
 def test_qwen3_asr_audio_conv_initializes_on_meta(monkeypatch):
