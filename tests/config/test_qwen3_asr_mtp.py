@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
+
 import pytest
 import torch
 from torch import nn
@@ -11,6 +13,7 @@ from vllm.model_executor.models.qwen3_asr_mtp import (
     Qwen3ASRMultiTokenPredictor,
     remap_qwen3_asr_mtp_weight_name,
 )
+from vllm.transformers_utils.config import get_config
 
 
 def _qwen3_asr_config(
@@ -54,11 +57,67 @@ def test_qwen3_asr_mtp5_draft_config_preserves_depth_and_position_mode():
     assert draft.mtp_branch_position_mode == "shifted"
 
 
+def test_qwen3_asr_mtp_override_accepts_parser_text_config_shape():
+    config = PretrainedConfig(
+        architectures=["Qwen3ASRForConditionalGeneration"],
+        mtp_num_hidden_layers=5,
+        mtp_branch_position_mode="base",
+    )
+    config.model_type = "qwen3_asr_text"
+
+    draft = SpeculativeConfig.hf_config_override(config)
+
+    assert draft.model_type == "qwen3_asr_mtp"
+    assert draft.architectures == ["Qwen3ASRMTP"]
+    assert draft.n_predict == 5
+
+
 def test_qwen3_asr_mtp_config_rejects_unknown_position_mode():
     with pytest.raises(ValueError, match="mtp_branch_position_mode"):
         SpeculativeConfig.hf_config_override(
             _qwen3_asr_config(5, position_mode="unknown")
         )
+
+
+def test_qwen3_asr_mtp_override_through_hf_config_parser(tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3ASRForConditionalGeneration"],
+                "model_type": "qwen3_asr",
+                "mtp_num_hidden_layers": 5,
+                "num_nextn_predict_layers": 5,
+                "mtp_branch_position_mode": "base",
+                "thinker_config": {
+                    "audio_config": {
+                        "model_type": "qwen3_asr_audio_encoder",
+                    },
+                    "text_config": {
+                        "model_type": "qwen3",
+                        "vocab_size": 32,
+                        "hidden_size": 16,
+                        "intermediate_size": 32,
+                        "num_hidden_layers": 2,
+                        "num_attention_heads": 2,
+                        "num_key_value_heads": 2,
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    draft = get_config(
+        tmp_path,
+        trust_remote_code=False,
+        hf_overrides_fn=SpeculativeConfig.hf_config_override,
+    )
+
+    assert draft.model_type == "qwen3_asr_mtp"
+    assert draft.architectures == ["Qwen3ASRMTP"]
+    assert draft.mtp_num_hidden_layers == 5
+    assert draft.mtp_branch_position_mode == "base"
 
 
 def test_qwen3_asr_mtp_config_requires_trained_depth():

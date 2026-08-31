@@ -301,8 +301,12 @@ class SpeculativeConfig:
     @staticmethod
     def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
         initial_architecture = hf_config.architectures[0]
-        if hf_config.model_type == "qwen3_asr":
-            n_predict = getattr(hf_config, "mtp_num_hidden_layers", None)
+        n_predict = getattr(hf_config, "mtp_num_hidden_layers", None)
+        is_qwen3_asr_mtp = hf_config.model_type == "qwen3_asr" or (
+            initial_architecture == "Qwen3ASRForConditionalGeneration"
+            and isinstance(n_predict, int)
+        )
+        if is_qwen3_asr_mtp:
             if not isinstance(n_predict, int) or n_predict < 1:
                 raise ValueError(
                     "Qwen3-ASR MTP requires a positive mtp_num_hidden_layers "
@@ -316,7 +320,17 @@ class SpeculativeConfig:
                     "Qwen3-ASR MTP requires mtp_branch_position_mode to be "
                     f"'base' or 'shifted', got {branch_position_mode!r}"
                 )
-            hf_config = copy.deepcopy(hf_config.thinker_config.text_config)
+            thinker_config = getattr(hf_config, "thinker_config", None)
+            text_config = getattr(thinker_config, "text_config", None)
+            if text_config is None:
+                text_config = getattr(hf_config, "text_config", None)
+            if text_config is not None:
+                hf_config = copy.deepcopy(text_config)
+            else:
+                # Some config-parser paths instantiate the composite on-disk
+                # config as its text config class while preserving the target
+                # architecture and exported MTP fields.
+                hf_config = copy.deepcopy(hf_config)
             hf_config.model_type = "qwen3_asr_mtp"
             hf_config.update(
                 {
