@@ -13,6 +13,7 @@ from transformers import PretrainedConfig
 from vllm.config.speculative import SpeculativeConfig
 from vllm.model_executor.models.qwen3_asr_mtp import (
     Qwen3ASRMultiTokenPredictor,
+    _get_qwen3_asr_mtp_config,
     remap_qwen3_asr_mtp_weight_name,
 )
 from vllm.model_executor.models.qwen3_omni_moe_thinker import (
@@ -221,6 +222,26 @@ def test_qwen3_asr_spec_config_repairs_composite_draft_model_config():
 def test_qwen3_asr_mtp_config_requires_trained_depth():
     with pytest.raises(ValueError, match="mtp_num_hidden_layers"):
         SpeculativeConfig.hf_config_override(_qwen3_asr_config(None))
+
+
+def test_qwen3_asr_mtp_model_uses_text_only_draft_config():
+    target_config = SimpleNamespace(
+        model_type="qwen3_asr",
+        architectures=["Qwen3ASRForConditionalGeneration"],
+    )
+    draft_config = SimpleNamespace(
+        model_type="qwen3_asr_mtp",
+        architectures=["Qwen3ASRMTP"],
+        vocab_size=32,
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=target_config),
+        speculative_config=SimpleNamespace(
+            draft_model_config=SimpleNamespace(hf_config=draft_config)
+        ),
+    )
+
+    assert _get_qwen3_asr_mtp_config(vllm_config) is draft_config
 
 
 def test_qwen3_asr_audio_conv_initializes_on_meta(monkeypatch):

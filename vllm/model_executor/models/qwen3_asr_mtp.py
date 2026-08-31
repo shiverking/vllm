@@ -3,6 +3,7 @@
 """Inference-only ParaASR-style MTP model for Qwen3-ASR."""
 
 from collections.abc import Iterable
+from typing import Any
 
 import torch
 from torch import nn
@@ -23,6 +24,16 @@ from vllm.model_executor.models.utils import PPMissingLayer, maybe_prefix
 from vllm.sequence import IntermediateTensors
 
 
+def _get_qwen3_asr_mtp_config(vllm_config: VllmConfig) -> Any:
+    speculative_config = vllm_config.speculative_config
+    if (
+        speculative_config is None
+        or speculative_config.draft_model_config is None
+    ):
+        raise ValueError("Qwen3-ASR MTP requires a draft model config")
+    return speculative_config.draft_model_config.hf_config
+
+
 def remap_qwen3_asr_mtp_weight_name(name: str) -> str | None:
     """Map the self-contained Qwen3-ASR checkpoint layout to this model."""
     if name.startswith("mtp."):
@@ -39,7 +50,7 @@ def remap_qwen3_asr_mtp_weight_name(name: str) -> str | None:
 class Qwen3ASRMTPBlock(nn.Module):
     def __init__(self, vllm_config: VllmConfig, prefix: str) -> None:
         super().__init__()
-        config = vllm_config.model_config.hf_config
+        config = _get_qwen3_asr_mtp_config(vllm_config)
         quant_config = vllm_config.quant_config
         self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.embedding_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -84,7 +95,7 @@ class Qwen3ASRMTPBlock(nn.Module):
 class Qwen3ASRMultiTokenPredictor(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
-        config = vllm_config.model_config.hf_config
+        config = _get_qwen3_asr_mtp_config(vllm_config)
         self.num_mtp_layers = int(config.mtp_num_hidden_layers)
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -130,7 +141,7 @@ class Qwen3ASRMTP(nn.Module):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
-        self.config = vllm_config.model_config.hf_config
+        self.config = _get_qwen3_asr_mtp_config(vllm_config)
         self.model = Qwen3ASRMultiTokenPredictor(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "model"),
