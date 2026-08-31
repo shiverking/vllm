@@ -119,6 +119,15 @@ def _create_conv2d_without_parameter_init(*args: Any, **kwargs: Any) -> nn.Conv2
     kwargs.setdefault("device", torch.get_default_device())
     return torch.nn.utils.skip_init(nn.Conv2d, *args, **kwargs)
 
+
+def _create_layer_norm_without_parameter_init(
+    *args: Any, **kwargs: Any
+) -> nn.LayerNorm:
+    """Allocate a LayerNorm without filling parameters on the device."""
+    kwargs.setdefault("device", torch.get_default_device())
+    return torch.nn.utils.skip_init(nn.LayerNorm, *args, **kwargs)
+
+
 # Speech input languages supported by Qwen3-Omni
 # From: https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct
 ISO639_1_SUPPORTED_LANGS = {
@@ -272,7 +281,9 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
         self.self_attn = Qwen3OmniMoeAudioAttention(
             config, prefix=f"{prefix}.self_attn"
         )
-        self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
+        self.self_attn_layer_norm = _create_layer_norm_without_parameter_init(
+            self.embed_dim
+        )
         self.activation_fn = _ACTIVATION_REGISTRY[config.activation_function]
         self.fc1 = ColumnParallelLinear(
             self.embed_dim,
@@ -286,7 +297,9 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
             bias=True,
             prefix=f"{prefix}.fc2",
         )
-        self.final_layer_norm = nn.LayerNorm(self.embed_dim)
+        self.final_layer_norm = _create_layer_norm_without_parameter_init(
+            self.embed_dim
+        )
 
     def forward(
         self,
@@ -394,7 +407,7 @@ class Qwen3OmniMoeAudioEncoder(nn.Module):
         )
 
         # Output layers
-        self.ln_post = nn.LayerNorm(config.d_model)
+        self.ln_post = _create_layer_norm_without_parameter_init(config.d_model)
         self.proj1 = ReplicatedLinear(
             config.d_model,
             config.d_model,

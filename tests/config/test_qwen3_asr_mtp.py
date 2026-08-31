@@ -17,6 +17,7 @@ from vllm.model_executor.models.qwen3_asr_mtp import (
 )
 from vllm.model_executor.models.qwen3_omni_moe_thinker import (
     _create_conv2d_without_parameter_init,
+    _create_layer_norm_without_parameter_init,
 )
 from vllm.transformers_utils.config import get_config
 
@@ -236,6 +237,22 @@ def test_qwen3_asr_audio_conv_initializes_on_meta(monkeypatch):
 
     assert reset_devices == ["meta"]
     assert conv.weight.device.type == torch.get_default_device().type
+
+
+def test_qwen3_asr_audio_layer_norm_initializes_on_meta(monkeypatch):
+    reset_devices = []
+    original_reset_parameters = nn.LayerNorm.reset_parameters
+
+    def track_reset_device(module):
+        reset_devices.append(module.weight.device.type)
+        original_reset_parameters(module)
+
+    monkeypatch.setattr(nn.LayerNorm, "reset_parameters", track_reset_device)
+
+    layer_norm = _create_layer_norm_without_parameter_init(16)
+
+    assert reset_devices == ["meta"]
+    assert layer_norm.weight.device.type == torch.get_default_device().type
 
 
 @pytest.mark.parametrize(
