@@ -646,6 +646,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--audio-manifest", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--mode", choices=("eager", "graph", "both"), default="both")
+    parser.add_argument(
+        "--enforce-eager",
+        action="store_true",
+        help=(
+            "Run numerical equivalence validation in eager mode only, "
+            "overriding --mode and disabling graph execution."
+        ),
+    )
     parser.add_argument("--append-ms", default="80,500,2000")
     parser.add_argument(
         "--prefix-seconds",
@@ -692,6 +700,12 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _resolve_modes(mode: str, enforce_eager: bool) -> tuple[str, ...]:
+    if enforce_eager:
+        return ("eager",)
+    return ("eager", "graph") if mode == "both" else (mode,)
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     if args.audio_manifest is not None and not args.audio_manifest.is_file():
         raise FileNotFoundError(
@@ -717,18 +731,24 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         force=True,
     )
     logger = logging.getLogger("qwen3-asr-incremental-encoder-probe")
+    if args.enforce_eager:
+        logger.info(
+            "--enforce-eager enabled; running eager numerical validation only"
+        )
 
     append_ms = _parse_number_list(args.append_ms, int)
     prefix_seconds = _parse_number_list(args.prefix_seconds)
     benchmark_seconds = set(_parse_number_list(args.benchmark_seconds))
     graph_sizes = _parse_number_list(args.audio_encoder_aclgraph_sizes, int)
     capture_sizes = _parse_number_list(args.cudagraph_capture_sizes, int)
-    modes = ("eager", "graph") if args.mode == "both" else (args.mode,)
+    modes = _resolve_modes(args.mode, args.enforce_eager)
     config = {
         "schema_version": SCHEMA_VERSION,
         "model_path": args.model_path,
         "audio_manifest": str(args.audio_manifest) if args.audio_manifest else None,
         "mode": args.mode,
+        "effective_modes": list(modes),
+        "enforce_eager": args.enforce_eager,
         "append_ms": append_ms,
         "prefix_seconds": prefix_seconds,
         "benchmark_seconds": sorted(benchmark_seconds),

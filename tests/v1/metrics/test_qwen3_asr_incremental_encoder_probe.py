@@ -7,6 +7,7 @@ import pytest
 from examples.speech_to_text.openai.qwen3_asr_incremental_encoder_probe import (
     _as_apply_model_function,
     _build_parser,
+    _resolve_modes,
     attention_sequence_lengths,
     derive_window_geometry,
     encoder_output_length,
@@ -26,6 +27,22 @@ def test_parser_defaults_to_float16_without_quantization():
     assert args.dtype == "float16"
     assert args.quantization == "none"
     assert args.load_format == "auto"
+    assert not args.enforce_eager
+
+
+def test_parser_accepts_enforce_eager():
+    args = _build_parser().parse_args(
+        [
+            "--model-path",
+            "model",
+            "--output-dir",
+            "output",
+            "--enforce-eager",
+        ]
+    )
+
+    assert args.enforce_eager
+    assert _resolve_modes(args.mode, args.enforce_eager) == ("eager",)
 
 
 def test_apply_model_wrapper_survives_engine_serialization(monkeypatch):
