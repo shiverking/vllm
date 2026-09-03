@@ -48,13 +48,6 @@ class WindowGeometry:
 
 
 @dataclass(frozen=True)
-class ModelLoadingResolution:
-    quantization: str | None
-    load_format: str
-    modelslim_config_found: bool
-
-
-@dataclass(frozen=True)
 class AudioCase:
     case_id: str
     audio: np.ndarray
@@ -62,44 +55,6 @@ class AudioCase:
     source: str = "synthetic"
     prompt: str | None = None
     request_kind: str = "final"
-
-
-def resolve_model_loading(
-    model_path: str,
-    quantization: str,
-    load_format: str,
-) -> ModelLoadingResolution:
-    """Resolve probe defaults without forcing ModelSlim on float models."""
-    model_dir = Path(model_path)
-    modelslim_config_found = (
-        model_dir.is_dir()
-        and (model_dir / "quant_model_description.json").is_file()
-    )
-    requested_quantization = quantization.lower()
-    if requested_quantization == "auto":
-        resolved_quantization = (
-            "ascend" if modelslim_config_found else None
-        )
-    elif requested_quantization == "none":
-        resolved_quantization = None
-    else:
-        if (
-            requested_quantization == "ascend"
-            and model_dir.is_dir()
-            and not modelslim_config_found
-        ):
-            raise ValueError(
-                "--quantization ascend requires "
-                "quant_model_description.json in the local model directory; "
-                "use --quantization none for float weights."
-            )
-        resolved_quantization = quantization
-
-    return ModelLoadingResolution(
-        quantization=resolved_quantization,
-        load_format=load_format,
-        modelslim_config_found=modelslim_config_found,
-    )
 
 
 def encoder_output_length(feature_frames: int) -> int:
@@ -699,11 +654,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dtype", default="auto")
     parser.add_argument(
         "--quantization",
-        default="auto",
-        help=(
-            "Quantization method. 'auto' enables Ascend ModelSlim only when "
-            "quant_model_description.json exists; 'none' forces float weights."
-        ),
+        default="none",
+        help="Quantization method; defaults to unquantized weights.",
     )
     parser.add_argument("--load-format", default="auto")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
@@ -750,19 +702,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     graph_sizes = _parse_number_list(args.audio_encoder_aclgraph_sizes, int)
     capture_sizes = _parse_number_list(args.cudagraph_capture_sizes, int)
     modes = ("eager", "graph") if args.mode == "both" else (args.mode,)
-    model_loading = resolve_model_loading(
-        args.model_path,
-        args.quantization,
-        args.load_format,
-    )
-    logger.info(
-        "Resolved model loading: quantization=%s, load_format=%s, "
-        "modelslim_config_found=%s",
-        model_loading.quantization,
-        model_loading.load_format,
-        model_loading.modelslim_config_found,
-    )
-
     config = {
         "schema_version": SCHEMA_VERSION,
         "model_path": args.model_path,
@@ -777,11 +716,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "timing_iterations": args.timing_iterations,
         "decoder_validation": not args.skip_decoder,
         "dtype": args.dtype,
-        "requested_quantization": args.quantization,
-        "resolved_quantization": model_loading.quantization,
-        "requested_load_format": args.load_format,
-        "resolved_load_format": model_loading.load_format,
-        "modelslim_config_found": model_loading.modelslim_config_found,
+        "quantization": args.quantization,
+        "load_format": args.load_format,
         "production_cache_implemented": False,
     }
     _write_json(args.output_dir / "config.json", config)
@@ -813,10 +749,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "enable_mm_embeds": not args.skip_decoder,
             "enforce_eager": mode == "eager",
         }
-        if model_loading.quantization is not None:
-            llm_kwargs["quantization"] = model_loading.quantization
-        if model_loading.load_format.lower() != "auto":
-            llm_kwargs["load_format"] = model_loading.load_format
+        if args.quantization.lower() != "none":
+            llm_kwargs["quantization"] = args.quantization
+        if args.load_format.lower() != "auto":
+            llm_kwargs["load_format"] = args.load_format
         if mode == "graph":
             llm_kwargs["compilation_config"] = {
                 "cudagraph_mode": "FULL",
