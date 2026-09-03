@@ -599,7 +599,7 @@ def _decoder_output(llm: Any, prompt: str, embedding: np.ndarray, max_tokens: in
     params = SamplingParams(temperature=0.0, max_tokens=max_tokens, logprobs=5)
     request = {
         "prompt": prompt,
-        "multi_modal_data": {"audio": torch.from_numpy(embedding)},
+        "multi_modal_data": {"audio": [torch.from_numpy(embedding)]},
     }
     start = time.perf_counter_ns()
     result = llm.generate(request, params, use_tqdm=False)[0].outputs[0]
@@ -693,6 +693,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
+    if args.audio_manifest is not None and not args.audio_manifest.is_file():
+        raise FileNotFoundError(
+            f"Audio manifest does not exist: {args.audio_manifest}. "
+            "Omit --audio-manifest to run the built-in synthetic cases."
+        )
+
     # apply_model transfers EncoderProbeCall to the local engine process.
     os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 

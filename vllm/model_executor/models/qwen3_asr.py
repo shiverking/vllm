@@ -23,7 +23,7 @@
 """Inference-only Qwen3-ASR model."""
 
 from collections.abc import Iterable, Mapping, Sequence
-from typing import Any
+from typing import Annotated, Any, Literal, TypeAlias
 
 import torch
 import torch.nn as nn
@@ -65,6 +65,7 @@ from vllm.multimodal.inputs import (
     MultiModalKwargsItems,
 )
 from vllm.multimodal.parse import (
+    AudioEmbeddingItems,
     AudioProcessorItems,
     DictEmbeddingItems,
     ModalityDataItems,
@@ -87,6 +88,7 @@ from vllm.transformers_utils.processor import cached_processor_from_config
 from vllm.transformers_utils.processors.qwen3_asr import (
     Qwen3ASRProcessor,
 )
+from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
 logger = init_logger(__name__)
 _ASR_TEXT_TAG = "<asr_text>"
@@ -99,6 +101,24 @@ def _get_feat_extract_output_lengths(input_lengths: torch.Tensor):
         ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (input_lengths // 100) * 13
     )
     return output_lengths
+
+
+class Qwen3ASRAudioEmbeddingInputs(TensorSchema):
+    type: Literal["audio_embeds"] = "audio_embeds"
+    audio_embeds: Annotated[
+        list[torch.Tensor],
+        TensorShape(
+            "num_audios",
+            "num_audio_tokens",
+            "hidden_size",
+            dynamic_dims={"num_audio_tokens"},
+        ),
+    ]
+
+
+Qwen3ASRAudioInputs: TypeAlias = (
+    Qwen2_5OmniAudioFeatureInputs | Qwen3ASRAudioEmbeddingInputs
+)
 
 
 class Qwen3ASRProcessingInfo(BaseProcessingInfo):
@@ -173,6 +193,7 @@ class Qwen3ASRDummyInputsBuilder(BaseDummyInputsBuilder[Qwen3ASRProcessingInfo])
 def _qwen3asr_field_config(hf_inputs: Mapping[str, torch.Tensor]):
     audio_feature_lengths = hf_inputs.get("audio_feature_lengths", torch.empty((0,)))
     return dict(
+        audio_embeds=MultiModalFieldConfig.batched("audio"),
         input_audio_features=MultiModalFieldConfig.flat_from_sizes(
             "audio", audio_feature_lengths, dim=1
         ),
@@ -227,7 +248,15 @@ class Qwen3ASRMultiModalProcessor(
         out_mm_data = out_mm_kwargs.get_data()
         audio_feature_lengths = out_mm_data.get("audio_feature_lengths")
         feature_attention_mask = out_mm_data.get("feature_attention_mask")
-        if audio_feature_lengths is None and feature_attention_mask is None:
+        audio_items = mm_items.get_items(
+            "audio", (AudioEmbeddingItems, AudioProcessorItems)
+        )
+        if isinstance(audio_items, AudioEmbeddingItems):
+            audio_output_lengths = [
+                audio_items.get_feature_size(index)
+                for index in range(audio_items.get_count())
+            ]
+        elif audio_feature_lengths is None and feature_attention_mask is None:
             audio_output_lengths = []
         elif audio_feature_lengths is not None:
             audio_output_lens = _get_feat_extract_output_lengths(audio_feature_lengths)
@@ -242,8 +271,9 @@ class Qwen3ASRMultiModalProcessor(
         def get_replacement_qwen2_audio(item_idx: int):
             num_features = audio_output_lengths[item_idx]
             if num_features == 0:
-                audios = mm_items.get_items("audio", AudioProcessorItems)
-                audio = audios.get(item_idx)
+                if isinstance(audio_items, AudioEmbeddingItems):
+                    raise ValueError("Audio embedding is empty")
+                audio = audio_items.get(item_idx)
                 raise ValueError(
                     f"The audio {audio} (len={len(audio)}) is too short "
                     "to be represented inside the model"
@@ -336,12 +366,18 @@ class Qwen3ASRForConditionalGeneration(
 
     def _parse_and_validate_audio_input(
         self, **kwargs: object
-    ) -> Qwen2_5OmniAudioFeatureInputs | None:
+    ) -> Qwen3ASRAudioInputs | None:
         input_audio_features = kwargs.pop("input_audio_features", None)
+        audio_embeds = kwargs.pop("audio_embeds", None)
         audio_feature_lengths = kwargs.pop("audio_feature_lengths", None)
         feature_attention_mask = kwargs.pop("feature_attention_mask", None)
-        if input_audio_features is None:
+        if input_audio_features is None and audio_embeds is None:
             return None
+
+        if audio_embeds is not None:
+            return Qwen3ASRAudioEmbeddingInputs(
+                type="audio_embeds", audio_embeds=audio_embeds
+            )
 
         return Qwen2_5OmniAudioFeatureInputs(
             type="audio_features",
@@ -357,7 +393,7 @@ class Qwen3ASRForConditionalGeneration(
         # from the order of kwargs.
         for input_key in kwargs:
             if (
-                input_key in ("input_audio_features")
+                input_key in ("input_audio_features", "audio_embeds")
                 and "audio" not in mm_input_by_modality
             ):
                 mm_input_by_modality["audio"] = self._parse_and_validate_audio_input(
@@ -367,8 +403,11 @@ class Qwen3ASRForConditionalGeneration(
 
     def _process_audio_input(
         self,
-        audio_input: Qwen2_5OmniAudioFeatureInputs,
-    ) -> torch.Tensor:
+        audio_input: Qwen3ASRAudioInputs,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        if audio_input["type"] == "audio_embeds":
+            return tuple(audio_input["audio_embeds"])
+
         input_features = audio_input["input_features"]
         audio_feature_lengths = audio_input["audio_feature_lengths"]
 
