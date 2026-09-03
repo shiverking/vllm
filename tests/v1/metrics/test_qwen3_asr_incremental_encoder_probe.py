@@ -10,6 +10,7 @@ from examples.speech_to_text.openai.qwen3_asr_incremental_encoder_probe import (
     _as_apply_model_function,
     _build_parser,
     _resolve_modes,
+    attention_window_feature_frames,
     attention_sequence_lengths,
     derive_window_geometry,
     encoder_output_length,
@@ -32,6 +33,36 @@ def test_parser_defaults_to_float16_without_quantization():
     assert args.quantization == "none"
     assert args.load_format == "auto"
     assert not args.enforce_eager
+    assert args.attention_window_seconds is None
+
+
+@pytest.mark.parametrize(("seconds", "frames"), [(4.0, 400), (2.0, 200)])
+def test_attention_window_seconds_map_to_feature_frames(seconds, frames):
+    assert attention_window_feature_frames(
+        seconds, sampling_rate=16000, hop_length=160
+    ) == frames
+
+
+def test_attention_window_seconds_must_be_positive():
+    with pytest.raises(ValueError, match="positive"):
+        attention_window_feature_frames(
+            0.0, sampling_rate=16000, hop_length=160
+        )
+
+
+def test_parser_accepts_smaller_attention_window():
+    args = _build_parser().parse_args(
+        [
+            "--model-path",
+            "model",
+            "--output-dir",
+            "output",
+            "--attention-window-seconds",
+            "4",
+        ]
+    )
+
+    assert args.attention_window_seconds == 4.0
 
 
 def test_parser_accepts_enforce_eager():

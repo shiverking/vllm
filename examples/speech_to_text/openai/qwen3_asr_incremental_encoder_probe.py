@@ -104,6 +104,22 @@ def stable_feature_frames(feature_frames: int, attention_window: int) -> int:
     return feature_frames // attention_window * attention_window
 
 
+def attention_window_feature_frames(
+    seconds: float, *, sampling_rate: int, hop_length: int
+) -> int:
+    """Convert an exact audio-window duration to feature frames."""
+    if seconds <= 0:
+        raise ValueError("Attention window seconds must be positive")
+    frames = seconds * sampling_rate / hop_length
+    rounded_frames = round(frames)
+    if not math.isclose(frames, rounded_frames, abs_tol=1e-9):
+        raise ValueError(
+            "Attention window seconds must map to an integer number of "
+            f"feature frames: seconds={seconds}, frames={frames}"
+        )
+    return rounded_frames
+
+
 def tail_conv_context_dummy_frames(
     tail_frames: int, conv_feature_window: int
 ) -> int:
@@ -371,6 +387,7 @@ class EncoderProbeCall:
     sampling_rate: int
     hop_length: int
     trace_layers: bool
+    attention_window_seconds: float | None = None
     repeat_count: int = 3
     warmup_iterations: int = 0
     timing_iterations: int = 0
@@ -381,9 +398,19 @@ class EncoderProbeCall:
         import torch
 
         encoder = model.audio_tower
+        native_n_window_infer = int(encoder.n_window_infer)
+        target_n_window_infer = (
+            attention_window_feature_frames(
+                self.attention_window_seconds,
+                sampling_rate=self.sampling_rate,
+                hop_length=self.hop_length,
+            )
+            if self.attention_window_seconds is not None
+            else native_n_window_infer
+        )
         geometry = derive_window_geometry(
             n_window=int(encoder.n_window),
-            n_window_infer=int(encoder.n_window_infer),
+            n_window_infer=target_n_window_infer,
             conv_chunksize=int(encoder.conv_chunksize),
             sampling_rate=self.sampling_rate,
             hop_length=self.hop_length,
@@ -404,16 +431,32 @@ class EncoderProbeCall:
         def output_length(length: int) -> int:
             return encoder_output_length(length)
 
+        def call_encoder(
+            features: torch.Tensor,
+            feature_lens: torch.Tensor,
+            aftercnn_lens: torch.Tensor,
+        ) -> torch.Tensor:
+            previous_n_window_infer = int(encoder.n_window_infer)
+            encoder.n_window_infer = target_n_window_infer
+            try:
+                return encoder(
+                    features,
+                    feature_lens=feature_lens,
+                    aftercnn_lens=aftercnn_lens,
+                )
+            finally:
+                encoder.n_window_infer = previous_n_window_infer
+
         def run(features: torch.Tensor, length: int) -> torch.Tensor:
             feature_lens = torch.tensor([length], dtype=torch.long, device="cpu")
             aftercnn_lens = torch.tensor(
                 [output_length(length)], dtype=torch.long, device="cpu"
             )
             with torch.inference_mode():
-                return encoder(
+                return call_encoder(
                     features[:, :length],
-                    feature_lens=feature_lens,
-                    aftercnn_lens=aftercnn_lens,
+                    feature_lens,
+                    aftercnn_lens,
                 )
 
         def run_tail(features: torch.Tensor, length: int) -> torch.Tensor:
@@ -446,10 +489,10 @@ class EncoderProbeCall:
                 device="cpu",
             )
             with torch.inference_mode():
-                outputs = encoder(
+                outputs = call_encoder(
                     combined,
-                    feature_lens=feature_lens,
-                    aftercnn_lens=aftercnn_lens,
+                    feature_lens,
+                    aftercnn_lens,
                 )
             return outputs[: output_length(length)]
 
@@ -600,6 +643,13 @@ class EncoderProbeCall:
             device_memory = {}
         return {
             "geometry": asdict(geometry),
+            "native_n_window_infer": native_n_window_infer,
+            "native_attention_window_seconds": (
+                native_n_window_infer * self.hop_length / self.sampling_rate
+            ),
+            "attention_window_overridden": (
+                target_n_window_infer != native_n_window_infer
+            ),
             "device": str(device),
             "dtype": str(encoder.dtype),
             "feature_length_x": self.feature_length_x,
@@ -736,6 +786,15 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--append-ms", default="80,500,2000")
     parser.add_argument(
+        "--attention-window-seconds",
+        type=float,
+        help=(
+            "Override the Audio Encoder bidirectional attention window for "
+            "this experiment. Use 4 or 2 to compare smaller windows with the "
+            "checkpoint's native window; omit to preserve the model config."
+        ),
+    )
+    parser.add_argument(
         "--prefix-seconds",
         default=",".join(str(item) for item in DEFAULT_PREFIX_SECONDS),
     )
@@ -833,6 +892,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "effective_modes": list(modes),
         "enforce_eager": args.enforce_eager,
         "append_ms": append_ms,
+        "attention_window_seconds": args.attention_window_seconds,
         "prefix_seconds": prefix_seconds,
         "benchmark_seconds": sorted(benchmark_seconds),
         "audio_encoder_aclgraph_sizes": graph_sizes,
@@ -935,6 +995,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         sampling_rate=sampling_rate,
                         hop_length=hop_length,
                         trace_layers=args.trace_layers,
+                        attention_window_seconds=args.attention_window_seconds,
                         warmup_iterations=args.warmup_iterations if benchmark else 0,
                         timing_iterations=args.timing_iterations if benchmark else 0,
                     )
@@ -956,6 +1017,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         "prefix_seconds": prefix_s,
                         "end_seconds": end_s,
                         "append_ms": append,
+                        "attention_window_seconds": result["geometry"][
+                            "attention_window_seconds"
+                        ],
+                        "native_n_window_infer": result["native_n_window_infer"],
+                        "native_attention_window_seconds": result[
+                            "native_attention_window_seconds"
+                        ],
+                        "attention_window_overridden": result[
+                            "attention_window_overridden"
+                        ],
                         "feature_length_x": length_x,
                         "feature_length_y": length_y,
                         "stable_feature_frames": stable_frames,
@@ -1016,6 +1087,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                             "mode": mode,
                             "case_id": case.case_id,
                             "end_seconds": end_s,
+                            "attention_window_seconds": result["geometry"][
+                                "attention_window_seconds"
+                            ],
                             "stable_encoder_tokens": result["stable_encoder_tokens"],
                             "cache_bytes": result["cache_bytes"],
                             **timing,
@@ -1040,6 +1114,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                             "case_id": case.case_id,
                             "request_kind": case.request_kind,
                             "end_seconds": end_s,
+                            "attention_window_seconds": result["geometry"][
+                                "attention_window_seconds"
+                            ],
+                            "attention_window_overridden": result[
+                                "attention_window_overridden"
+                            ],
                             "token_ids_equal": baseline["token_ids"]
                             == candidate["token_ids"],
                             "output_nonempty": bool(baseline["token_ids"])
@@ -1088,6 +1168,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                                     == baseline["token_ids"],
                                     "raw_audio_text_equal": raw_output["text"]
                                     == baseline["text"],
+                                    "native_window_token_ids_equal": raw_output[
+                                        "token_ids"
+                                    ]
+                                    == baseline["token_ids"],
+                                    "native_window_text_equal": raw_output["text"]
+                                    == baseline["text"],
+                                    "native_window_token_ids": raw_output[
+                                        "token_ids"
+                                    ],
+                                    "native_window_text": raw_output["text"],
                                     "raw_audio_done_ms": raw_output["duration_ms"],
                                     "incremental_done_lower_bound_ms": (
                                         candidate["duration_ms"]
@@ -1207,6 +1297,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "schema_version": SCHEMA_VERSION,
         "conclusion": conclusion,
         "geometry": geometry,
+        "attention_window_overridden": bool(
+            encoder_rows and encoder_rows[0]["attention_window_overridden"]
+        ),
+        "native_n_window_infer": (
+            encoder_rows[0]["native_n_window_infer"] if encoder_rows else None
+        ),
+        "native_attention_window_seconds": (
+            encoder_rows[0]["native_attention_window_seconds"]
+            if encoder_rows
+            else None
+        ),
         "encoder_case_count": len(encoder_rows),
         "decoder_case_count": len(decoder_rows),
         "feature_temporal_pass": feature_pass,
@@ -1214,6 +1315,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "encoder_reconstruction_pass": reconstruction_pass,
         "decoder_exact_match_pass": decoder_pass if not args.skip_decoder else None,
         "raw_audio_to_embedding_decoder_pass": raw_decoder_pass,
+        "native_window_decoder_exact_match_pass": raw_decoder_pass,
         "eager_to_graph_incremental_pass": cross_mode_pass,
         "eager_to_graph_decoder_pass": cross_mode_decoder_pass,
         "decoder_validation_skipped": args.skip_decoder,
@@ -1260,6 +1362,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "production_concurrency_benchmark_required": True,
         "limitations": [
             "This probe measures model-level cache-hit equivalence and encoder timing.",
+            "When the attention window is overridden, raw-audio decoder comparisons "
+            "use the checkpoint's native attention window and therefore expose "
+            "cross-window transcript changes.",
             "Final p95 at concurrency 20/32 requires an opt-in end-to-end "
             "cache prototype.",
         ],
@@ -1274,10 +1379,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "mode",
             "case_id",
             "end_seconds",
+            "attention_window_seconds",
             "token_ids_equal",
             "text_equal",
             "baseline_text",
             "candidate_text",
+            "native_window_text_equal",
+            "native_window_text",
         ]
         writer = csv.DictWriter(output, fieldnames=fields)
         writer.writeheader()
