@@ -51,5 +51,18 @@ def test_qwen3_asr_embedding_prompt_length_matches_embedding_tokens():
     assert updates[0].replacement(0) == [7, 7, 7]
 
 
+def test_qwen3_asr_precomputed_embeddings_skip_hf_processor():
+    embeddings = [torch.randn(3, 8)]
+    mm_items = MultiModalDataItems(
+        {"audio": AudioEmbeddingItems(embeddings, expected_hidden_size=8)}
+    )
+    processor = object.__new__(Qwen3ASRMultiModalProcessor)
+
+    processed = processor._apply_hf_processor_mm_only(mm_items, {}, {})
+
+    assert list(processed) == ["audio_embeds"]
+    assert processed["audio_embeds"][0] is embeddings[0]
+
+
 def test_qwen3_asr_field_config_batches_audio_embeddings():
     assert "audio_embeds" in _qwen3asr_field_config({})

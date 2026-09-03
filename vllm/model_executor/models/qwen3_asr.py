@@ -225,6 +225,25 @@ class Qwen3ASRMultiModalDataParser(MultiModalDataParser):
 class Qwen3ASRMultiModalProcessor(
     Qwen3OmniMoeThinkerMultiModalProcessor,
 ):
+    def _apply_hf_processor_mm_only(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+        tokenization_kwargs: Mapping[str, object],
+    ) -> BatchFeature:
+        if "audio" in mm_items:
+            audio_items = mm_items.get_items(
+                "audio", (AudioEmbeddingItems, AudioProcessorItems)
+            )
+            if isinstance(audio_items, AudioEmbeddingItems):
+                return BatchFeature(data=audio_items.get_passthrough_data())
+
+        return super()._apply_hf_processor_mm_only(
+            mm_items=mm_items,
+            hf_processor_mm_kwargs=hf_processor_mm_kwargs,
+            tokenization_kwargs=tokenization_kwargs,
+        )
+
     def _get_mm_fields_config(
         self,
         hf_inputs: BatchFeature,
