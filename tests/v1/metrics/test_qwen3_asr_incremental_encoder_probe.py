@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from examples.speech_to_text.openai.qwen3_asr_incremental_encoder_probe import (
+    _as_apply_model_function,
     _build_parser,
     attention_sequence_lengths,
     derive_window_geometry,
@@ -14,6 +15,7 @@ from examples.speech_to_text.openai.qwen3_asr_incremental_encoder_probe import (
     summarize_timings,
     tensor_metrics,
 )
+from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 
 def test_parser_defaults_to_float16_without_quantization():
@@ -24,6 +26,20 @@ def test_parser_defaults_to_float16_without_quantization():
     assert args.dtype == "float16"
     assert args.quantization == "none"
     assert args.load_format == "auto"
+
+
+def test_apply_model_wrapper_survives_engine_serialization(monkeypatch):
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+
+    class Callback:
+        def __call__(self, model):
+            return {"model": model}
+
+    wrapped = _as_apply_model_function(Callback())
+    decoded = MsgpackDecoder().decode(MsgpackEncoder().encode(wrapped))
+
+    assert callable(decoded)
+    assert decoded("audio-model") == {"model": "audio-model"}
 
 
 def test_window_geometry_is_derived_from_runtime_values():

@@ -21,6 +21,7 @@ import math
 import os
 import time
 import wave
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -570,6 +571,17 @@ class EncoderProbeCall:
         }
 
 
+def _as_apply_model_function(
+    callback: Callable[[Any], dict[str, Any]],
+) -> Callable[[Any], dict[str, Any]]:
+    # msgspec encodes a dataclass callable as a map. A real function takes the
+    # cloudpickle path and remains callable after crossing the engine boundary.
+    def invoke(model: Any) -> dict[str, Any]:
+        return callback(model)
+
+    return invoke
+
+
 def _write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding="utf-8")
 
@@ -812,7 +824,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         warmup_iterations=args.warmup_iterations if benchmark else 0,
                         timing_iterations=args.timing_iterations if benchmark else 0,
                     )
-                    result = llm.apply_model(callback)[0]
+                    result = llm.apply_model(
+                        _as_apply_model_function(callback)
+                    )[0]
                     geometry = result["geometry"]
                     stable_frames = result["stable_feature_frames"]
                     feature_metrics = tensor_metrics(
