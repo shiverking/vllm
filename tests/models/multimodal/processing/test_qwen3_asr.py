@@ -64,5 +64,21 @@ def test_qwen3_asr_precomputed_embeddings_skip_hf_processor():
     assert processed["audio_embeds"][0] is embeddings[0]
 
 
+def test_qwen3_asr_mrope_positions_accept_precomputed_embeddings():
+    audio_embed = torch.randn(3, 8)
+    mm_feature = SimpleNamespace(
+        data={"audio_embeds": SimpleNamespace(data=audio_embed)},
+        mm_position=SimpleNamespace(offset=2, length=3),
+    )
+
+    positions, delta = Qwen3ASRForConditionalGeneration.get_mrope_input_positions(
+        None, [1, 2, 7, 7, 7, 3], [mm_feature]
+    )
+
+    expected = torch.arange(6, dtype=torch.long).view(1, -1).expand(3, -1)
+    assert torch.equal(positions, expected)
+    assert delta == 0
+
+
 def test_qwen3_asr_field_config_batches_audio_embeddings():
     assert "audio_embeds" in _qwen3asr_field_config({})
