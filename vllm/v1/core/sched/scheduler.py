@@ -52,6 +52,7 @@ from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutp
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
+from vllm.v1.metrics.streaming_probe import emit_streaming_probe
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
@@ -782,6 +783,16 @@ class Scheduler(SchedulerInterface):
                     continue
 
                 self.running.append(request)
+                emit_streaming_probe(
+                    "engine",
+                    "request_first_scheduled",
+                    request.request_id,
+                    status=request.status.name,
+                    num_running=len(self.running),
+                    num_waiting=len(self.waiting) + len(self.skipped_waiting),
+                    prompt_tokens=request.num_prompt_tokens,
+                    output_tokens=len(request.output_token_ids),
+                )
                 if self.log_stats:
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
@@ -934,6 +945,16 @@ class Scheduler(SchedulerInterface):
         """
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
+        )
+        emit_streaming_probe(
+            "engine",
+            "request_preempted",
+            request.request_id,
+            status=request.status.name,
+            num_running=len(self.running),
+            num_waiting=len(self.waiting) + len(self.skipped_waiting),
+            prompt_tokens=request.num_prompt_tokens,
+            output_tokens=len(request.output_token_ids),
         )
         self.kv_cache_manager.free(request)
         self.encoder_cache_manager.free(request)
@@ -1642,6 +1663,15 @@ class Scheduler(SchedulerInterface):
         else:
             request.status = RequestStatus.WAITING_FOR_STREAMING_REQ
             self.num_waiting_for_streaming_input += 1
+            emit_streaming_probe(
+                "engine",
+                "streaming_waiting",
+                request.request_id,
+                status=request.status.name,
+                num_running=len(self.running),
+                num_waiting=len(self.waiting) + len(self.skipped_waiting),
+                streaming_queue_depth=0,
+            )
 
         self._enqueue_waiting_request(request)
         return False
@@ -1760,9 +1790,30 @@ class Scheduler(SchedulerInterface):
                 assert existing.streaming_queue is not None, "duplicate request id"
                 # Queue next input chunk (or finished sentinel).
                 existing.streaming_queue.append(update)
+                emit_streaming_probe(
+                    "engine",
+                    "streaming_update_queued",
+                    request.request_id,
+                    status=existing.status.name,
+                    num_running=len(self.running),
+                    num_waiting=len(self.waiting) + len(self.skipped_waiting),
+                    streaming_queue_depth=len(existing.streaming_queue),
+                    streaming_final=update is None,
+                )
             elif update is not None:
                 # Commence next input chunk.
                 self._update_request_as_session(existing, update)
+                emit_streaming_probe(
+                    "engine",
+                    "streaming_update_queued",
+                    request.request_id,
+                    status=existing.status.name,
+                    num_running=len(self.running),
+                    num_waiting=len(self.waiting) + len(self.skipped_waiting),
+                    streaming_queue_depth=0,
+                    streaming_final=False,
+                    applied_immediately=True,
+                )
             else:
                 # Streaming-input session finished.
                 self.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
@@ -1771,6 +1822,17 @@ class Scheduler(SchedulerInterface):
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
+            emit_streaming_probe(
+                "engine",
+                "request_queued",
+                request.request_id,
+                status=request.status.name,
+                num_running=len(self.running),
+                num_waiting=len(self.waiting) + len(self.skipped_waiting),
+                prompt_tokens=request.num_prompt_tokens,
+                output_tokens=len(request.output_token_ids),
+                resumable=request.resumable,
+            )
             if self.connector is not None:
                 self.connector.on_new_request(request)
             if self.log_stats:
@@ -1843,6 +1905,21 @@ class Scheduler(SchedulerInterface):
         self, request: Request, delay_free_blocks: bool = False
     ) -> dict[str, Any] | None:
         assert request.is_finished()
+
+        finish_reason = request.get_finished_reason()
+        emit_streaming_probe(
+            "engine",
+            "request_finished",
+            request.request_id,
+            status=request.status.name,
+            num_running=len(self.running),
+            num_waiting=len(self.waiting) + len(self.skipped_waiting),
+            prompt_tokens=request.num_prompt_tokens,
+            output_tokens=len(request.output_token_ids),
+            finish_reason=(
+                finish_reason.name.lower() if finish_reason is not None else None
+            ),
+        )
 
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)

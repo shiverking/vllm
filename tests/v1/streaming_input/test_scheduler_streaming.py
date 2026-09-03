@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -81,6 +81,16 @@ def create_scheduler() -> Scheduler:
 
 
 class TestStreamingScheduler(unittest.TestCase):
+    @patch("vllm.v1.core.sched.scheduler.emit_streaming_probe")
+    def test_probe_records_queue_and_streaming_update(self, probe):
+        scheduler = create_scheduler()
+        scheduler.add_request(DummyRequest(request_id="session", resumable=True))
+        scheduler.add_request(DummyRequest(request_id="session", resumable=True))
+
+        events = [call.args[1] for call in probe.call_args_list]
+        assert events == ["request_queued", "streaming_update_queued"]
+        assert probe.call_args_list[-1].kwargs["streaming_queue_depth"] == 1
+
     def test_add_request(self):
         scheduler = create_scheduler()
 

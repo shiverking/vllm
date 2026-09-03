@@ -77,6 +77,7 @@ from vllm.v1.engine.utils import (
 from vllm.v1.executor import Executor
 from vllm.v1.kv_cache_interface import KVCacheConfig, get_kv_cache_spec_kind
 from vllm.v1.metrics.stats import SchedulerStats
+from vllm.v1.metrics.streaming_probe import emit_streaming_probe
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
@@ -365,6 +366,14 @@ class EngineCore:
                 "Disabling KVTransfer for this request."
             )
 
+        emit_streaming_probe(
+            "engine",
+            "engine_request_added",
+            request.request_id,
+            status=request.status.name,
+            prompt_tokens=request.num_prompt_tokens,
+            resumable=request.resumable,
+        )
         self.scheduler.add_request(request)
         if request.abort_immediately:
             # Immediately abort so the connector's request_finished hook runs

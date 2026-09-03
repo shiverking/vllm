@@ -37,6 +37,7 @@ from vllm.v1.metrics.stats import (
     RequestStateStats,
     SchedulerStats,
 )
+from vllm.v1.metrics.streaming_probe import emit_streaming_probe
 
 # shared empty CPU tensor used as a placeholder pooling output
 EMPTY_CPU_TENSOR = torch.empty(0, device="cpu")
@@ -172,6 +173,7 @@ class RequestState:
         self.is_prefilling = True
         self.queue = queue
         self.num_cached_tokens = 0
+        self.streaming_probe_first_token_recorded = False
 
         self.stats = RequestStateStats(arrival_time=arrival_time) if log_stats else None
 
@@ -485,6 +487,21 @@ class OutputProcessor:
             if req_state is not None:
                 self.lora_states.request_finished(request_id, req_state.lora_name)
                 request_ids_to_abort.append(request_id)
+                emit_streaming_probe(
+                    "api",
+                    "request_finished",
+                    request_id,
+                    external_request_id=req_state.external_req_id,
+                    prompt_tokens=req_state.prompt_len,
+                    cached_tokens=req_state.num_cached_tokens,
+                    output_tokens=(
+                        req_state.detokenizer.num_output_tokens()
+                        if req_state.detokenizer is not None
+                        else None
+                    ),
+                    finish_reason="abort",
+                    streaming_input=req_state.streaming_input,
+                )
                 # Produce final abort output.
                 if req_state.queue is not None and (
                     request_output := req_state.make_request_output(
@@ -647,6 +664,22 @@ class OutputProcessor:
                 # if required.
                 req_state.logprobs_processor.update_from_output(engine_core_output)
 
+            if new_token_ids and not req_state.streaming_probe_first_token_recorded:
+                emit_streaming_probe(
+                    "api",
+                    "request_first_token",
+                    req_id,
+                    external_request_id=req_state.external_req_id,
+                    prompt_tokens=req_state.prompt_len,
+                    cached_tokens=req_state.num_cached_tokens,
+                    output_tokens=(
+                        req_state.detokenizer.num_output_tokens()
+                        if req_state.detokenizer is not None
+                        else None
+                    ),
+                )
+                req_state.streaming_probe_first_token_recorded = True
+
             # 4) Create and handle RequestOutput objects.
             if request_output := req_state.make_request_output(
                 new_token_ids,
@@ -667,6 +700,22 @@ class OutputProcessor:
 
             # Free completed requests.
             if finish_reason is not None:
+                if not req_state.streaming_input:
+                    emit_streaming_probe(
+                        "api",
+                        "request_finished",
+                        req_id,
+                        external_request_id=req_state.external_req_id,
+                        prompt_tokens=req_state.prompt_len,
+                        cached_tokens=req_state.num_cached_tokens,
+                        output_tokens=(
+                            req_state.detokenizer.num_output_tokens()
+                            if req_state.detokenizer is not None
+                            else None
+                        ),
+                        finish_reason=finish_reason.name.lower(),
+                        streaming_input=False,
+                    )
                 if req_state.streaming_input:
                     if req_state.input_chunk_queue:
                         update = req_state.input_chunk_queue.popleft()

@@ -51,6 +51,7 @@ from vllm.v1.metrics.loggers import (
 )
 from vllm.v1.metrics.prometheus import shutdown_prometheus
 from vllm.v1.metrics.stats import IterationStats
+from vllm.v1.metrics.streaming_probe import emit_streaming_probe
 
 logger = init_logger(__name__)
 
@@ -405,6 +406,18 @@ class AsyncLLM(EngineClient):
         index: int,
         queue: RequestOutputCollector,
     ):
+        emit_streaming_probe(
+            "api",
+            "request_received",
+            request.request_id,
+            external_request_id=request.external_req_id,
+            prompt_tokens=(
+                len(request.prompt_token_ids)
+                if request.prompt_token_ids is not None
+                else None
+            ),
+            resumable=request.resumable,
+        )
         # Add the request to OutputProcessor (this process).
         self.output_processor.add_request(request, prompt, parent_req, index, queue)
 
