@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from examples.speech_to_text.openai.qwen3_asr_incremental_encoder_probe import (
+    _build_parser,
     attention_sequence_lengths,
     derive_window_geometry,
     encoder_output_length,
@@ -13,6 +14,16 @@ from examples.speech_to_text.openai.qwen3_asr_incremental_encoder_probe import (
     summarize_timings,
     tensor_metrics,
 )
+
+
+def test_parser_defaults_to_float16_without_quantization():
+    args = _build_parser().parse_args(
+        ["--model-path", "model", "--output-dir", "output"]
+    )
+
+    assert args.dtype == "float16"
+    assert args.quantization == "none"
+    assert args.load_format == "auto"
 
 
 def test_window_geometry_is_derived_from_runtime_values():

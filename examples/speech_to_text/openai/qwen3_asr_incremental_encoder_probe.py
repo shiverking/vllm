@@ -18,6 +18,7 @@ import csv
 import json
 import logging
 import math
+import os
 import time
 import wave
 from dataclasses import asdict, dataclass
@@ -651,7 +652,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=",".join(str(item) for item in DEFAULT_DECODE_GRAPH_SIZES),
     )
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
-    parser.add_argument("--dtype", default="auto")
+    parser.add_argument("--dtype", default="float16")
     parser.add_argument(
         "--quantization",
         default="none",
@@ -680,6 +681,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
+    # apply_model transfers EncoderProbeCall to the local engine process.
+    os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
+
     from vllm import LLM
     from vllm.distributed import cleanup_dist_env_and_memory
     from vllm.transformers_utils.processor import cached_processor_from_config
