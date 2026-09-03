@@ -9,10 +9,42 @@ from examples.speech_to_text.openai.qwen3_asr_incremental_encoder_probe import (
     derive_window_geometry,
     encoder_output_length,
     passes_numerical_gate,
+    resolve_model_loading,
     stable_feature_frames,
     summarize_timings,
     tensor_metrics,
 )
+
+
+def test_model_loading_auto_uses_float_defaults_without_modelslim(tmp_path):
+    resolution = resolve_model_loading(str(tmp_path), "auto", "auto")
+
+    assert resolution.quantization is None
+    assert resolution.load_format == "auto"
+    assert not resolution.modelslim_config_found
+
+
+def test_model_loading_auto_detects_modelslim_config(tmp_path):
+    (tmp_path / "quant_model_description.json").write_text("{}")
+
+    resolution = resolve_model_loading(str(tmp_path), "auto", "auto")
+
+    assert resolution.quantization == "ascend"
+    assert resolution.modelslim_config_found
+
+
+def test_model_loading_explicit_none_and_load_format(tmp_path):
+    resolution = resolve_model_loading(
+        str(tmp_path), "none", "sharded_state"
+    )
+
+    assert resolution.quantization is None
+    assert resolution.load_format == "sharded_state"
+
+
+def test_model_loading_rejects_ascend_for_local_float_model(tmp_path):
+    with pytest.raises(ValueError, match="quant_model_description.json"):
+        resolve_model_loading(str(tmp_path), "ascend", "auto")
 
 
 def test_window_geometry_is_derived_from_runtime_values():
