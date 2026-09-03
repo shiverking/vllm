@@ -6,9 +6,10 @@
 This is an offline diagnostic. It intentionally does not add a production
 cache or require changes to the Qwen3-ASR WebSocket service.
 
-The optional manifest is JSONL. Each row contains ``path`` and may contain
-``id``, ``language``, ``request_kind``, and an exact ``prompt``. Relative audio
-paths are resolved against the manifest directory.
+Input can be one audio file or an optional JSONL manifest. Each manifest row
+contains ``path`` and may contain ``id``, ``language``, ``request_kind``, and an
+exact ``prompt``. Relative audio paths are resolved against the manifest
+directory.
 """
 
 from __future__ import annotations
@@ -101,6 +102,15 @@ def derive_window_geometry(
 
 def stable_feature_frames(feature_frames: int, attention_window: int) -> int:
     return feature_frames // attention_window * attention_window
+
+
+def tail_conv_context_dummy_frames(
+    tail_frames: int, conv_feature_window: int
+) -> int:
+    """Return the dummy-item size needed to preserve Conv2D padding context."""
+    if 0 < tail_frames < conv_feature_window:
+        return conv_feature_window
+    return 0
 
 
 def attention_sequence_lengths(
@@ -239,6 +249,23 @@ def _read_wav(path: Path, target_rate: int) -> np.ndarray:
     return audio
 
 
+def load_audio_file(path: Path, sampling_rate: int) -> np.ndarray:
+    try:
+        import soundfile as sf
+
+        audio, rate = sf.read(path, dtype="float32", always_2d=False)
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+        if rate != sampling_rate:
+            old_positions = np.arange(audio.size, dtype=np.float64) / rate
+            new_size = int(round(audio.size * sampling_rate / rate))
+            new_positions = np.arange(new_size, dtype=np.float64) / sampling_rate
+            audio = np.interp(new_positions, old_positions, audio)
+        return np.asarray(audio, dtype=np.float32)
+    except ImportError:
+        return _read_wav(path, sampling_rate)
+
+
 def load_audio_manifest(path: Path | None, sampling_rate: int) -> list[AudioCase]:
     if path is None:
         return []
@@ -251,22 +278,7 @@ def load_audio_manifest(path: Path | None, sampling_rate: int) -> list[AudioCase
             audio_path = Path(item["path"])
             if not audio_path.is_absolute():
                 audio_path = path.parent / audio_path
-            try:
-                import soundfile as sf
-
-                audio, rate = sf.read(audio_path, dtype="float32", always_2d=False)
-                if audio.ndim > 1:
-                    audio = audio.mean(axis=1)
-                if rate != sampling_rate:
-                    old_positions = np.arange(audio.size, dtype=np.float64) / rate
-                    new_size = int(round(audio.size * sampling_rate / rate))
-                    new_positions = (
-                        np.arange(new_size, dtype=np.float64) / sampling_rate
-                    )
-                    audio = np.interp(new_positions, old_positions, audio)
-                audio = np.asarray(audio, dtype=np.float32)
-            except ImportError:
-                audio = _read_wav(audio_path, sampling_rate)
+            audio = load_audio_file(audio_path, sampling_rate)
             cases.append(
                 AudioCase(
                     case_id=str(item.get("id", f"manifest-{line_number}")),
@@ -299,6 +311,28 @@ def synthetic_audio_cases(
         ),
         AudioCase("synthetic-boundary-impulse", impulse),
     ]
+
+
+def load_audio_cases(
+    *,
+    audio_file: Path | None,
+    audio_manifest: Path | None,
+    sampling_rate: int,
+    skip_synthetic: bool,
+) -> list[AudioCase]:
+    if audio_file is not None:
+        return [
+            AudioCase(
+                case_id=audio_file.stem,
+                audio=load_audio_file(audio_file, sampling_rate),
+                source=str(audio_file),
+            )
+        ]
+
+    cases = load_audio_manifest(audio_manifest, sampling_rate)
+    if not skip_synthetic:
+        cases.extend(synthetic_audio_cases(sampling_rate))
+    return cases
 
 
 def _processor_features(processor: Any, audio: np.ndarray) -> tuple[np.ndarray, int]:
@@ -355,6 +389,11 @@ class EncoderProbeCall:
             hop_length=self.hop_length,
         )
         device = encoder.device
+        stable_frames = stable_feature_frames(
+            self.feature_length_x, geometry.attention_feature_window
+        )
+        stable_tokens = encoder_output_length(stable_frames) if stable_frames else 0
+        stable_conv_chunks = stable_frames // geometry.conv_feature_window
 
         def prepare(features: np.ndarray) -> torch.Tensor:
             return torch.from_numpy(features).to(device=device, dtype=encoder.dtype)
@@ -376,6 +415,43 @@ class EncoderProbeCall:
                     feature_lens=feature_lens,
                     aftercnn_lens=aftercnn_lens,
                 )
+
+        def run_tail(features: torch.Tensor, length: int) -> torch.Tensor:
+            dummy_frames = (
+                tail_conv_context_dummy_frames(
+                    length, geometry.conv_feature_window
+                )
+                if stable_frames
+                else 0
+            )
+            if not dummy_frames:
+                return run(features, length)
+
+            # A full accumulated input always has 100-frame chunks before a
+            # short tail, so pad_sequence expands that tail to the same width.
+            # Add an independent dummy item to reproduce that Conv2D padding
+            # context without changing the encoder implementation.
+            dummy = torch.zeros(
+                (features.shape[0], dummy_frames),
+                dtype=features.dtype,
+                device=features.device,
+            )
+            combined = torch.cat((features[:, :length], dummy), dim=1)
+            feature_lens = torch.tensor(
+                [length, dummy_frames], dtype=torch.long, device="cpu"
+            )
+            aftercnn_lens = torch.tensor(
+                [output_length(length), output_length(dummy_frames)],
+                dtype=torch.long,
+                device="cpu",
+            )
+            with torch.inference_mode():
+                outputs = encoder(
+                    combined,
+                    feature_lens=feature_lens,
+                    aftercnn_lens=aftercnn_lens,
+                )
+            return outputs[: output_length(length)]
 
         def capture(
             features: torch.Tensor, length: int
@@ -429,25 +505,16 @@ class EncoderProbeCall:
                 for hook in hooks:
                     hook.remove()
 
-        stable_frames = stable_feature_frames(
-            self.feature_length_x, geometry.attention_feature_window
-        )
-        stable_tokens = output_length(stable_frames) if stable_frames else 0
-        stable_conv_chunks = stable_frames // geometry.conv_feature_window
-
         repeated = [run(x, self.feature_length_x) for _ in range(self.repeat_count)]
         output_x, traces_x = capture(x, self.feature_length_x)
         output_y, traces_y = capture(y, self.feature_length_y)
 
         block_outputs = []
-        for start in range(0, stable_frames, geometry.attention_feature_window):
-            end = start + geometry.attention_feature_window
-            block_outputs.append(
-                run(y[:, start:end], geometry.attention_feature_window)
-            )
+        if stable_tokens:
+            block_outputs.append(output_x[:stable_tokens].detach())
         tail_frames = self.feature_length_y - stable_frames
         if tail_frames:
-            block_outputs.append(run(y[:, stable_frames:], tail_frames))
+            block_outputs.append(run_tail(y[:, stable_frames:], tail_frames))
         incremental = (
             torch.cat(block_outputs, dim=0)
             if block_outputs
@@ -486,7 +553,7 @@ class EncoderProbeCall:
             for _ in range(self.warmup_iterations):
                 run(y, self.feature_length_y)
                 if tail_frames:
-                    run(y[:, stable_frames:], tail_frames)
+                    run_tail(y[:, stable_frames:], tail_frames)
             _sync_device(torch, device.type)
             for _ in range(self.timing_iterations):
                 start = time.perf_counter_ns()
@@ -496,7 +563,7 @@ class EncoderProbeCall:
 
                 start = time.perf_counter_ns()
                 if tail_frames:
-                    tail_output = run(y[:, stable_frames:], tail_frames)
+                    tail_output = run_tail(y[:, stable_frames:], tail_frames)
                     torch.cat([*block_outputs[:-1], tail_output], dim=0)
                 else:
                     torch.cat(block_outputs, dim=0)
@@ -540,6 +607,13 @@ class EncoderProbeCall:
             "stable_feature_frames": stable_frames,
             "stable_encoder_tokens": stable_tokens,
             "tail_feature_frames": tail_frames,
+            "tail_context_dummy_frames": (
+                tail_conv_context_dummy_frames(
+                    tail_frames, geometry.conv_feature_window
+                )
+                if stable_frames
+                else 0
+            ),
             "attention_sequence_lengths_x": attention_sequence_lengths(
                 self.feature_length_x, geometry
             ),
@@ -643,7 +717,13 @@ def _raw_audio_output(
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", required=True)
-    parser.add_argument("--audio-manifest", type=Path)
+    audio_input = parser.add_mutually_exclusive_group()
+    audio_input.add_argument(
+        "--audio-file",
+        type=Path,
+        help="Validate one audio file without creating a manifest.",
+    )
+    audio_input.add_argument("--audio-manifest", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--mode", choices=("eager", "graph", "both"), default="both")
     parser.add_argument(
@@ -707,6 +787,8 @@ def _resolve_modes(mode: str, enforce_eager: bool) -> tuple[str, ...]:
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
+    if args.audio_file is not None and not args.audio_file.is_file():
+        raise FileNotFoundError(f"Audio file does not exist: {args.audio_file}")
     if args.audio_manifest is not None and not args.audio_manifest.is_file():
         raise FileNotFoundError(
             f"Audio manifest does not exist: {args.audio_manifest}. "
@@ -745,6 +827,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     config = {
         "schema_version": SCHEMA_VERSION,
         "model_path": args.model_path,
+        "audio_file": str(args.audio_file) if args.audio_file else None,
         "audio_manifest": str(args.audio_manifest) if args.audio_manifest else None,
         "mode": args.mode,
         "effective_modes": list(modes),
@@ -760,6 +843,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "dtype": args.dtype,
         "quantization": args.quantization,
         "load_format": args.load_format,
+        "skip_synthetic": args.skip_synthetic,
+        "case_limit": args.case_limit,
         "production_cache_implemented": False,
     }
     _write_json(args.output_dir / "config.json", config)
@@ -808,9 +893,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         processor = cached_processor_from_config(llm.model_config)
         sampling_rate = int(processor.feature_extractor.sampling_rate)
         hop_length = int(processor.feature_extractor.hop_length)
-        cases = load_audio_manifest(args.audio_manifest, sampling_rate)
-        if not args.skip_synthetic:
-            cases.extend(synthetic_audio_cases(sampling_rate))
+        cases = load_audio_cases(
+            audio_file=args.audio_file,
+            audio_manifest=args.audio_manifest,
+            sampling_rate=sampling_rate,
+            skip_synthetic=args.skip_synthetic,
+        )
         if args.case_limit is not None:
             cases = cases[: args.case_limit]
         if not cases:
@@ -873,6 +961,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         "stable_feature_frames": stable_frames,
                         "stable_encoder_tokens": result["stable_encoder_tokens"],
                         "tail_feature_frames": result["tail_feature_frames"],
+                        "tail_context_dummy_frames": result[
+                            "tail_context_dummy_frames"
+                        ],
                         "attention_sequence_lengths_x": result[
                             "attention_sequence_lengths_x"
                         ],

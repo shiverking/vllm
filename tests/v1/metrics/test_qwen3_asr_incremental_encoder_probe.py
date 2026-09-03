@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import wave
+
 import numpy as np
 import pytest
 
@@ -11,9 +13,11 @@ from examples.speech_to_text.openai.qwen3_asr_incremental_encoder_probe import (
     attention_sequence_lengths,
     derive_window_geometry,
     encoder_output_length,
+    load_audio_cases,
     passes_numerical_gate,
     stable_feature_frames,
     summarize_timings,
+    tail_conv_context_dummy_frames,
     tensor_metrics,
 )
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
@@ -43,6 +47,59 @@ def test_parser_accepts_enforce_eager():
 
     assert args.enforce_eager
     assert _resolve_modes(args.mode, args.enforce_eager) == ("eager",)
+
+
+def test_parser_accepts_one_audio_file():
+    args = _build_parser().parse_args(
+        [
+            "--model-path",
+            "model",
+            "--output-dir",
+            "output",
+            "--audio-file",
+            "sample.wav",
+        ]
+    )
+
+    assert str(args.audio_file) == "sample.wav"
+    assert args.audio_manifest is None
+
+
+def test_parser_rejects_audio_file_with_manifest():
+    with pytest.raises(SystemExit):
+        _build_parser().parse_args(
+            [
+                "--model-path",
+                "model",
+                "--output-dir",
+                "output",
+                "--audio-file",
+                "sample.wav",
+                "--audio-manifest",
+                "manifest.jsonl",
+            ]
+        )
+
+
+def test_single_audio_file_does_not_add_synthetic_cases(tmp_path):
+    audio_path = tmp_path / "sample.wav"
+    samples = np.asarray([0, 16384, -16384], dtype="<i2")
+    with wave.open(str(audio_path), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(16000)
+        output.writeframes(samples.tobytes())
+
+    cases = load_audio_cases(
+        audio_file=audio_path,
+        audio_manifest=None,
+        sampling_rate=16000,
+        skip_synthetic=False,
+    )
+
+    assert len(cases) == 1
+    assert cases[0].case_id == "sample"
+    np.testing.assert_allclose(cases[0].audio, [0.0, 0.5, -0.5])
 
 
 def test_apply_model_wrapper_survives_engine_serialization(monkeypatch):
@@ -85,6 +142,14 @@ def test_stable_feature_frames_only_returns_complete_attention_windows(
     feature_frames, expected
 ):
     assert stable_feature_frames(feature_frames, 400) == expected
+
+
+def test_short_incremental_tail_requests_full_conv_padding_context():
+    assert tail_conv_context_dummy_frames(0, 100) == 0
+    assert tail_conv_context_dummy_frames(50, 100) == 100
+    assert tail_conv_context_dummy_frames(99, 100) == 100
+    assert tail_conv_context_dummy_frames(100, 100) == 0
+    assert tail_conv_context_dummy_frames(250, 100) == 0
 
 
 def test_invalid_window_ratio_is_rejected():
