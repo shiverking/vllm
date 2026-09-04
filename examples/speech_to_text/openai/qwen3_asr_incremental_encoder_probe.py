@@ -100,8 +100,23 @@ def derive_window_geometry(
     )
 
 
-def stable_feature_frames(feature_frames: int, attention_window: int) -> int:
-    return feature_frames // attention_window * attention_window
+def stable_feature_frames(
+    feature_frames: int,
+    attention_window: int,
+    *,
+    guard_frames: int = 0,
+    lag_windows: int = 0,
+) -> int:
+    """Return cacheable frames after applying the requested seal policy."""
+    if attention_window <= 0:
+        raise ValueError("Attention window must be positive")
+    if guard_frames < 0:
+        raise ValueError("Seal guard frames must be non-negative")
+    if lag_windows < 0:
+        raise ValueError("Seal lag windows must be non-negative")
+    eligible_frames = max(feature_frames - guard_frames, 0)
+    complete_frames = eligible_frames // attention_window * attention_window
+    return max(complete_frames - lag_windows * attention_window, 0)
 
 
 def attention_window_feature_frames(
@@ -116,6 +131,22 @@ def attention_window_feature_frames(
         raise ValueError(
             "Attention window seconds must map to an integer number of "
             f"feature frames: seconds={seconds}, frames={frames}"
+        )
+    return rounded_frames
+
+
+def seal_guard_feature_frames(
+    milliseconds: float, *, sampling_rate: int, hop_length: int
+) -> int:
+    """Convert an exact right-context duration to feature frames."""
+    if milliseconds < 0:
+        raise ValueError("Seal guard milliseconds must be non-negative")
+    frames = milliseconds * sampling_rate / (1000 * hop_length)
+    rounded_frames = round(frames)
+    if not math.isclose(frames, rounded_frames, abs_tol=1e-9):
+        raise ValueError(
+            "Seal guard milliseconds must map to an integer number of "
+            f"feature frames: milliseconds={milliseconds}, frames={frames}"
         )
     return rounded_frames
 
@@ -333,6 +364,7 @@ def load_audio_cases(
     *,
     audio_file: Path | None,
     audio_manifest: Path | None,
+    audio_language: str | None,
     sampling_rate: int,
     skip_synthetic: bool,
 ) -> list[AudioCase]:
@@ -341,6 +373,7 @@ def load_audio_cases(
             AudioCase(
                 case_id=audio_file.stem,
                 audio=load_audio_file(audio_file, sampling_rate),
+                language=audio_language,
                 source=str(audio_file),
             )
         ]
@@ -388,6 +421,8 @@ class EncoderProbeCall:
     hop_length: int
     trace_layers: bool
     attention_window_seconds: float | None = None
+    seal_guard_ms: float = 0.0
+    seal_lag_windows: int = 0
     repeat_count: int = 3
     warmup_iterations: int = 0
     timing_iterations: int = 0
@@ -416,8 +451,16 @@ class EncoderProbeCall:
             hop_length=self.hop_length,
         )
         device = encoder.device
+        guard_frames = seal_guard_feature_frames(
+            self.seal_guard_ms,
+            sampling_rate=self.sampling_rate,
+            hop_length=self.hop_length,
+        )
         stable_frames = stable_feature_frames(
-            self.feature_length_x, geometry.attention_feature_window
+            self.feature_length_x,
+            geometry.attention_feature_window,
+            guard_frames=guard_frames,
+            lag_windows=self.seal_lag_windows,
         )
         stable_tokens = encoder_output_length(stable_frames) if stable_frames else 0
         stable_conv_chunks = stable_frames // geometry.conv_feature_window
@@ -650,6 +693,9 @@ class EncoderProbeCall:
             "attention_window_overridden": (
                 target_n_window_infer != native_n_window_infer
             ),
+            "seal_guard_ms": self.seal_guard_ms,
+            "seal_guard_feature_frames": guard_frames,
+            "seal_lag_windows": self.seal_lag_windows,
             "device": str(device),
             "dtype": str(encoder.dtype),
             "feature_length_x": self.feature_length_x,
@@ -774,6 +820,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Validate one audio file without creating a manifest.",
     )
     audio_input.add_argument("--audio-manifest", type=Path)
+    parser.add_argument(
+        "--audio-language",
+        help=(
+            "Expected language label for --audio-file (for example zh, en, es, "
+            "th, ar, or pt). This labels reports and does not force decoding."
+        ),
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--mode", choices=("eager", "graph", "both"), default="both")
     parser.add_argument(
@@ -792,6 +845,25 @@ def _build_parser() -> argparse.ArgumentParser:
             "Override the Audio Encoder bidirectional attention window for "
             "this experiment. Use 4 or 2 to compare smaller windows with the "
             "checkpoint's native window; omit to preserve the model config."
+        ),
+    )
+    parser.add_argument(
+        "--seal-guard-ms",
+        type=float,
+        default=0.0,
+        help=(
+            "Right context required before sealing a complete attention window. "
+            "Useful candidates are 80, 160, and 320 milliseconds."
+        ),
+    )
+    parser.add_argument(
+        "--seal-lag-windows",
+        type=int,
+        default=0,
+        help=(
+            "Keep this many additional complete attention windows mutable after "
+            "applying --seal-guard-ms; use 1 for the conservative one-window-lag "
+            "policy."
         ),
     )
     parser.add_argument(
@@ -846,6 +918,12 @@ def _resolve_modes(mode: str, enforce_eager: bool) -> tuple[str, ...]:
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
+    if args.audio_language is not None and args.audio_file is None:
+        raise ValueError("--audio-language requires --audio-file")
+    if args.seal_guard_ms < 0:
+        raise ValueError("--seal-guard-ms must be non-negative")
+    if args.seal_lag_windows < 0:
+        raise ValueError("--seal-lag-windows must be non-negative")
     if args.audio_file is not None and not args.audio_file.is_file():
         raise FileNotFoundError(f"Audio file does not exist: {args.audio_file}")
     if args.audio_manifest is not None and not args.audio_manifest.is_file():
@@ -887,12 +965,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "schema_version": SCHEMA_VERSION,
         "model_path": args.model_path,
         "audio_file": str(args.audio_file) if args.audio_file else None,
+        "audio_language": args.audio_language,
         "audio_manifest": str(args.audio_manifest) if args.audio_manifest else None,
         "mode": args.mode,
         "effective_modes": list(modes),
         "enforce_eager": args.enforce_eager,
         "append_ms": append_ms,
         "attention_window_seconds": args.attention_window_seconds,
+        "seal_guard_ms": args.seal_guard_ms,
+        "seal_lag_windows": args.seal_lag_windows,
         "prefix_seconds": prefix_seconds,
         "benchmark_seconds": sorted(benchmark_seconds),
         "audio_encoder_aclgraph_sizes": graph_sizes,
@@ -956,6 +1037,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         cases = load_audio_cases(
             audio_file=args.audio_file,
             audio_manifest=args.audio_manifest,
+            audio_language=args.audio_language,
             sampling_rate=sampling_rate,
             skip_synthetic=args.skip_synthetic,
         )
@@ -996,6 +1078,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         hop_length=hop_length,
                         trace_layers=args.trace_layers,
                         attention_window_seconds=args.attention_window_seconds,
+                        seal_guard_ms=args.seal_guard_ms,
+                        seal_lag_windows=args.seal_lag_windows,
                         warmup_iterations=args.warmup_iterations if benchmark else 0,
                         timing_iterations=args.timing_iterations if benchmark else 0,
                     )
@@ -1027,6 +1111,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         "attention_window_overridden": result[
                             "attention_window_overridden"
                         ],
+                        "seal_guard_ms": result["seal_guard_ms"],
+                        "seal_guard_feature_frames": result[
+                            "seal_guard_feature_frames"
+                        ],
+                        "seal_lag_windows": result["seal_lag_windows"],
                         "feature_length_x": length_x,
                         "feature_length_y": length_y,
                         "stable_feature_frames": stable_frames,
@@ -1090,6 +1179,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                             "attention_window_seconds": result["geometry"][
                                 "attention_window_seconds"
                             ],
+                            "seal_guard_ms": result["seal_guard_ms"],
+                            "seal_lag_windows": result["seal_lag_windows"],
                             "stable_encoder_tokens": result["stable_encoder_tokens"],
                             "cache_bytes": result["cache_bytes"],
                             **timing,
@@ -1308,6 +1399,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             if encoder_rows
             else None
         ),
+        "seal_policy": {
+            "guard_ms": args.seal_guard_ms,
+            "lag_windows": args.seal_lag_windows,
+        },
         "encoder_case_count": len(encoder_rows),
         "decoder_case_count": len(decoder_rows),
         "feature_temporal_pass": feature_pass,
@@ -1365,6 +1460,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "When the attention window is overridden, raw-audio decoder comparisons "
             "use the checkpoint's native attention window and therefore expose "
             "cross-window transcript changes.",
+            "Seal guards are evaluated against cumulative feature frames; a positive "
+            "guard delays the newest complete window until enough right context exists.",
             "Final p95 at concurrency 20/32 requires an opt-in end-to-end "
             "cache prototype.",
         ],

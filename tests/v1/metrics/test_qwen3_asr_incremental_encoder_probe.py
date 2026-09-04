@@ -16,6 +16,7 @@ from examples.speech_to_text.openai.qwen3_asr_incremental_encoder_probe import (
     encoder_output_length,
     load_audio_cases,
     passes_numerical_gate,
+    seal_guard_feature_frames,
     stable_feature_frames,
     summarize_timings,
     tail_conv_context_dummy_frames,
@@ -34,6 +35,9 @@ def test_parser_defaults_to_float16_without_quantization():
     assert args.load_format == "auto"
     assert not args.enforce_eager
     assert args.attention_window_seconds is None
+    assert args.audio_language is None
+    assert args.seal_guard_ms == 0.0
+    assert args.seal_lag_windows == 0
 
 
 @pytest.mark.parametrize(("seconds", "frames"), [(4.0, 400), (2.0, 200)])
@@ -63,6 +67,29 @@ def test_parser_accepts_smaller_attention_window():
     )
 
     assert args.attention_window_seconds == 4.0
+
+
+def test_parser_accepts_language_and_safe_seal_policy():
+    args = _build_parser().parse_args(
+        [
+            "--model-path",
+            "model",
+            "--output-dir",
+            "output",
+            "--audio-file",
+            "sample.wav",
+            "--audio-language",
+            "pt",
+            "--seal-guard-ms",
+            "160",
+            "--seal-lag-windows",
+            "1",
+        ]
+    )
+
+    assert args.audio_language == "pt"
+    assert args.seal_guard_ms == 160.0
+    assert args.seal_lag_windows == 1
 
 
 def test_parser_accepts_enforce_eager():
@@ -124,12 +151,14 @@ def test_single_audio_file_does_not_add_synthetic_cases(tmp_path):
     cases = load_audio_cases(
         audio_file=audio_path,
         audio_manifest=None,
+        audio_language="pt",
         sampling_rate=16000,
         skip_synthetic=False,
     )
 
     assert len(cases) == 1
     assert cases[0].case_id == "sample"
+    assert cases[0].language == "pt"
     np.testing.assert_allclose(cases[0].audio, [0.0, 0.5, -0.5])
 
 
@@ -173,6 +202,18 @@ def test_stable_feature_frames_only_returns_complete_attention_windows(
     feature_frames, expected
 ):
     assert stable_feature_frames(feature_frames, 400) == expected
+
+
+def test_safe_seal_guard_and_lag_exclude_mutable_windows():
+    assert seal_guard_feature_frames(
+        80, sampling_rate=16000, hop_length=160
+    ) == 8
+    assert stable_feature_frames(400, 400, guard_frames=8) == 0
+    assert stable_feature_frames(408, 400, guard_frames=8) == 400
+    assert stable_feature_frames(800, 400, lag_windows=1) == 400
+    assert stable_feature_frames(
+        808, 400, guard_frames=8, lag_windows=1
+    ) == 400
 
 
 def test_short_incremental_tail_requests_full_conv_padding_context():
