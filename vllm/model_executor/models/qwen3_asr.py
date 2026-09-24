@@ -350,12 +350,8 @@ class Qwen3ASRForConditionalGeneration(
         )
         return EncoderCudaGraphConfig(
             modalities=["audio"] if graph_enabled else [],
-            input_key_by_modality={
-                "audio": "_audio_encoder_hidden_states",
-            },
-            buffer_keys=[],
+            buffer_keys=["_audio_encoder_hidden_states"],
             out_hidden_size=self.config.audio_config.output_dim,
-            requires_runtime_sequence_lengths=True,
         )
 
     def get_input_modality(self, mm_kwargs: dict[str, Any]) -> str:
@@ -443,14 +439,12 @@ class Qwen3ASRForConditionalGeneration(
         sequence_lengths = torch.tensor(
             [token_budget], dtype=torch.int32, device="cpu"
         )
-        buffers = {
-            "cu_seqlens": cu_seqlens,
-            "sequence_lengths": sequence_lengths,
-        }
         return EncoderCudaGraphCaptureInputs(
-            mm_kwargs={"_audio_encoder_hidden_states": hidden_states},
-            buffers=buffers,
-            graph_input=hidden_states,
+            values={
+                "_audio_encoder_hidden_states": hidden_states,
+                "cu_seqlens": cu_seqlens,
+                "sequence_lengths": sequence_lengths,
+            },
         )
 
     def _prepare_audio_encoder_graph_inputs(
@@ -479,18 +473,19 @@ class Qwen3ASRForConditionalGeneration(
             self._prepare_audio_encoder_graph_inputs(mm_kwargs)
         )
         return EncoderCudaGraphReplayBuffers(
-            buffers={"sequence_lengths": sequence_lengths},
-            graph_input=hidden_states,
+            values={
+                "_audio_encoder_hidden_states": hidden_states,
+                "sequence_lengths": sequence_lengths,
+            },
         )
 
     def encoder_cudagraph_forward(
         self,
-        mm_kwargs: dict[str, Any],
-        buffers: dict[str, torch.Tensor],
+        values: dict[str, torch.Tensor],
     ) -> torch.Tensor:
-        hidden_states = mm_kwargs["_audio_encoder_hidden_states"]
-        cu_seqlens = buffers["cu_seqlens"]
-        sequence_lengths = buffers["sequence_lengths"]
+        hidden_states = values["_audio_encoder_hidden_states"]
+        cu_seqlens = values["cu_seqlens"]
+        sequence_lengths = values["sequence_lengths"]
         max_seqlen = self.audio_tower.compute_attn_mask_seqlen(cu_seqlens)
         return self.audio_tower._forward_encoder_body(
             hidden_states,

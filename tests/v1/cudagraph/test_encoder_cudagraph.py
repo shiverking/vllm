@@ -12,6 +12,7 @@ Test organization:
     - TestEncoderCudaGraphVideoReplay   — video modality capture, replay
 """
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -737,17 +738,20 @@ def test_preprocessed_graph_input_overrides_modality_input():
         def get_encoder_cudagraph_item_specs(self, mm_kwargs):
             return [EncoderItemSpec(input_size=2, output_tokens=2)]
 
-        def get_input_modality(self, mm_kwargs):
-            return "audio"
+        def prepare_encoder_cudagraph_replay_buffers(self, *args):
+            return EncoderCudaGraphReplayBuffers(
+                values={"_audio_encoder_hidden_states": torch.ones(2, 2)}
+            )
 
     manager = object.__new__(EncoderCudaGraphManager)
     manager.model = _Model()
     manager.config = EncoderCudaGraphConfig(
         modalities=["audio"],
-        input_key_by_modality={"audio": "raw_input"},
-        buffer_keys=[],
+        buffer_keys=["_audio_encoder_hidden_states"],
         out_hidden_size=2,
     )
+    manager.max_batch_size = 1
+    manager.max_frames_per_batch = 0
     manager.graph_hits = 0
     manager.graph_misses = 0
     static_input = torch.full((4, 2), -1.0)
@@ -758,22 +762,35 @@ def test_preprocessed_graph_input_overrides_modality_input():
             max_batch_size=1,
             max_frames_per_batch=1,
             graph=_Graph(),
-            input_buffer=static_input,
-            metadata_buffers={},
+            input_buffers={"_audio_encoder_hidden_states": static_input},
             output_buffer=output,
         )
     }
 
-    replay = EncoderCudaGraphReplayBuffers(
-        buffers={}, graph_input=torch.ones(2, 2)
-    )
-    result = manager._run_budget_graph(
-        {"raw_input": torch.full((2, 2), 7.0)}, 4, replay
-    )
+    result = manager._run_budget_graph({"raw_input": torch.full((2, 2), 7.0)}, 4)
 
     assert result is output
     torch.testing.assert_close(static_input[:2], torch.ones(2, 2))
     torch.testing.assert_close(static_input[2:], torch.zeros(2, 2))
+
+
+def test_qwen3_asr_config_uses_v023_encoder_graph_fields():
+    from vllm.model_executor.models.qwen3_asr import (
+        Qwen3ASRForConditionalGeneration,
+    )
+
+    model = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(tensor_parallel_size=1)
+        ),
+        audio_tower=SimpleNamespace(dtype=torch.float16),
+        config=SimpleNamespace(audio_config=SimpleNamespace(output_dim=128)),
+    )
+    config = Qwen3ASRForConditionalGeneration.get_encoder_cudagraph_config(model)
+
+    assert config.modalities == ["audio"]
+    assert config.buffer_keys == ["_audio_encoder_hidden_states"]
+    assert config.out_hidden_size == 128
 
 
 # ---------------------------------------------------------------------------
