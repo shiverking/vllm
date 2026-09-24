@@ -440,6 +440,34 @@ class Qwen3OmniMoeAudioEncoder(nn.Module):
         feature_lens: torch.Tensor,
         aftercnn_lens: torch.Tensor,
     ):
+        (
+            hidden_states,
+            cu_seqlens,
+            max_seqlen,
+            sequence_lengths,
+        ) = self._prepare_encoder_body_inputs(
+            input_features,
+            feature_lens,
+            aftercnn_lens,
+        )
+        return self._forward_encoder_body(
+            hidden_states,
+            cu_seqlens,
+            max_seqlen,
+            sequence_lengths,
+        )
+
+    def _prepare_encoder_body_inputs(
+        self,
+        input_features: torch.Tensor,
+        feature_lens: torch.Tensor,
+        aftercnn_lens: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor,
+    ]:
         feature_lens_cpu = feature_lens.to(device="cpu", dtype=torch.long)
         aftercnn_lens_cpu = aftercnn_lens.to(device="cpu", dtype=torch.long)
         chunk_num = torch.ceil(feature_lens_cpu / (self.n_window * 2)).long()
@@ -524,7 +552,7 @@ class Qwen3OmniMoeAudioEncoder(nn.Module):
         ).cumsum(-1, dtype=torch.int32)
 
         max_seqlen = self.compute_attn_mask_seqlen(cu_seqlens)
-        return self._forward_encoder_body(
+        return (
             hidden_states,
             cu_seqlens,
             max_seqlen,
@@ -560,6 +588,13 @@ class Qwen3OmniMoeAudioEncoder(nn.Module):
         for _ in range(3):
             lengths = (lengths - 1) // 2 + 1
         return lengths
+
+    def get_attention_window_tokens(self) -> int:
+        chunk_tokens = self.n_window * 2
+        cnn_tokens = int(
+            self._get_cnn_output_lengths(torch.tensor([chunk_tokens]))[0]
+        )
+        return cnn_tokens * self.n_window_infer // chunk_tokens
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights with mapping from HuggingFace format."""

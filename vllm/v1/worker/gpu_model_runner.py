@@ -6403,7 +6403,9 @@ class GPUModelRunner(
                     dtype=self.dtype,
                     model=cast(SupportsEncoderCudaGraph, raw_model),
                 )
-                logger.info("Initialized EncoderCudaGraphManager for vision encoder")
+                logger.info(
+                    "Initialized EncoderCudaGraphManager for multimodal encoder"
+                )
 
         compilation_counter.num_gpu_runner_capture_triggers += 1
 

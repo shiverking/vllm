@@ -56,6 +56,9 @@ class EncoderCudaGraphConfig:
     Only relevant when "video" is in ``modalities``.
     Image-only models can use the default of 1."""
 
+    requires_runtime_sequence_lengths: bool = False
+    """Whether replay must update variable host-side sequence lengths."""
+
 
 @dataclass
 class EncoderCudaGraphCaptureInputs:
@@ -74,6 +77,14 @@ class EncoderCudaGraphCaptureInputs:
     tensor objects and copies new data into them before each
     ``graph.replay()`` call (buffer identity invariant)."""
 
+    graph_input: torch.Tensor | None = None
+    """Optional preprocessed tensor copied into the static graph input.
+
+    Models whose dynamic frontend stays outside the graph can provide the
+    resulting encoder hidden states here. When omitted, the manager keeps
+    using ``input_key_by_modality`` from ``mm_kwargs``.
+    """
+
 
 @dataclass
 class EncoderCudaGraphReplayBuffers:
@@ -88,3 +99,6 @@ class EncoderCudaGraphReplayBuffers:
     """Data to copy into the captured buffers before replay.
     ``None`` values leave the corresponding captured buffer
     unchanged."""
+
+    graph_input: torch.Tensor | None = None
+    """Optional preprocessed tensor used as the graph input for this replay."""

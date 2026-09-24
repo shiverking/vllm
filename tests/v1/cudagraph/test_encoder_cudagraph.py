@@ -20,6 +20,7 @@ import torch
 from vllm.model_executor.models.interfaces import SupportsEncoderCudaGraph
 from vllm.platforms import current_platform
 from vllm.v1.worker.encoder_cudagraph import (
+    BudgetGraphMetadata,
     EncoderCudaGraphManager,
 )
 from vllm.v1.worker.encoder_cudagraph_defs import (
@@ -725,6 +726,54 @@ class TestGetInputModality:
         assert "video" in cfg.modalities
         assert cfg.input_key_by_modality["image"] == "pixel_values"
         assert cfg.input_key_by_modality["video"] == "pixel_values_videos"
+
+
+def test_preprocessed_graph_input_overrides_modality_input():
+    class _Graph:
+        def replay(self):
+            pass
+
+    class _Model:
+        def get_encoder_cudagraph_item_specs(self, mm_kwargs):
+            return [EncoderItemSpec(input_size=2, output_tokens=2)]
+
+        def get_input_modality(self, mm_kwargs):
+            return "audio"
+
+    manager = object.__new__(EncoderCudaGraphManager)
+    manager.model = _Model()
+    manager.config = EncoderCudaGraphConfig(
+        modalities=["audio"],
+        input_key_by_modality={"audio": "raw_input"},
+        buffer_keys=[],
+        out_hidden_size=2,
+    )
+    manager.graph_hits = 0
+    manager.graph_misses = 0
+    static_input = torch.full((4, 2), -1.0)
+    output = torch.zeros(4, 2)
+    manager.budget_graphs = {
+        4: BudgetGraphMetadata(
+            token_budget=4,
+            max_batch_size=1,
+            max_frames_per_batch=1,
+            graph=_Graph(),
+            input_buffer=static_input,
+            metadata_buffers={},
+            output_buffer=output,
+        )
+    }
+
+    replay = EncoderCudaGraphReplayBuffers(
+        buffers={}, graph_input=torch.ones(2, 2)
+    )
+    result = manager._run_budget_graph(
+        {"raw_input": torch.full((2, 2), 7.0)}, 4, replay
+    )
+
+    assert result is output
+    torch.testing.assert_close(static_input[:2], torch.ones(2, 2))
+    torch.testing.assert_close(static_input[2:], torch.zeros(2, 2))
 
 
 # ---------------------------------------------------------------------------

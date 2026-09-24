@@ -21,6 +21,7 @@ from vllm.model_executor.models.utils import scatter_output_slices
 from vllm.model_executor.models.vision import get_load_balance_assignment
 from vllm.v1.worker.encoder_cudagraph_defs import (
     EncoderCudaGraphConfig,
+    EncoderCudaGraphReplayBuffers,
     EncoderItemSpec,
 )
 
@@ -54,6 +55,8 @@ class BudgetGraphMetadata:
 class EncoderCudaGraphManager:
     """Budget-based CUDA graph capture/replay for vision encoders."""
 
+    supports_runtime_sequence_lengths = False
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -68,6 +71,11 @@ class EncoderCudaGraphManager:
         self.dtype = dtype
         self.model = model
         self.config: EncoderCudaGraphConfig = model.get_encoder_cudagraph_config()
+        if (
+            self.config.requires_runtime_sequence_lengths
+            and not self.supports_runtime_sequence_lengths
+        ):
+            self.config.modalities = []
 
         comp_config = vllm_config.compilation_config
         user_budgets = comp_config.encoder_cudagraph_token_budgets
@@ -186,6 +194,9 @@ class EncoderCudaGraphManager:
 
     def capture(self):
         """Capture CUDA graphs for all token budgets."""
+        if not self.config.modalities:
+            logger.info("Skipping encoder graph capture: no enabled modalities")
+            return
         for token_budget in self.token_budgets:
             self._capture_budget_graph(token_budget)
 
@@ -224,16 +235,18 @@ class EncoderCudaGraphManager:
             output = self.model.encoder_cudagraph_forward(mm_kwargs, buffers)
             output_buffer.copy_(output)
 
-        # Since the image and video modalities share the same per-patch shape,
-        # so we can use the image dummy inputs to capture CUDA graph for both
-        # image and video.
-        input_key = self.config.input_key_by_modality["image"]
+        graph_input = capture_inputs.graph_input
+        if graph_input is None:
+            input_key = self.config.input_key_by_modality[
+                self.model.get_input_modality(mm_kwargs)
+            ]
+            graph_input = mm_kwargs[input_key]
         self.budget_graphs[token_budget] = BudgetGraphMetadata(
             token_budget=token_budget,
             max_batch_size=self.max_batch_size,
             max_frames_per_batch=self.max_frames_per_batch,
             graph=graph,
-            input_buffer=mm_kwargs[input_key],
+            input_buffer=graph_input,
             metadata_buffers=buffers,
             output_buffer=output_buffer,
         )
@@ -263,14 +276,14 @@ class EncoderCudaGraphManager:
         self,
         mm_kwargs: dict[str, Any],
         token_budget: int,
-        replay_buffers: dict[str, torch.Tensor | None],
+        replay: EncoderCudaGraphReplayBuffers,
     ) -> torch.Tensor | None:
         """Execute budget graph.
 
         Args:
             mm_kwargs: Multimodal inputs for the batch.
             token_budget: Token budget to use.
-            replay_buffers: Buffer values to copy into captured buffers.
+            replay: Model-prepared graph input and metadata buffers.
                 None values leave the corresponding buffer unchanged.
 
         Returns:
@@ -286,16 +299,19 @@ class EncoderCudaGraphManager:
         # Copy the input tensor. Buffers are sized for the full budget;
         # actual inputs may be smaller. Zero then slice-copy so padded
         # positions are invisible to attention (cu_seqlens masks them out).
-        input_key = self.config.input_key_by_modality[
-            self.model.get_input_modality(mm_kwargs)
-        ]
-        src = mm_kwargs[input_key]
+        src = replay.graph_input
+        if src is None:
+            input_key = self.config.input_key_by_modality[
+                self.model.get_input_modality(mm_kwargs)
+            ]
+            src = mm_kwargs[input_key]
         n = src.shape[0]
+        graph_meta.input_buffer.zero_()
         graph_meta.input_buffer[:n].copy_(src)
 
         # Copy metadata buffers using keys from config.buffer_keys.
         for key in self.config.buffer_keys:
-            src = replay_buffers.get(key)
+            src = replay.buffers.get(key)
             if src is None:
                 continue
             buf = graph_meta.metadata_buffers[key]
@@ -427,7 +443,7 @@ class EncoderCudaGraphManager:
 
                 # graph_hits counted inside _run_budget_graph after replay.
                 output = self._run_budget_graph(
-                    batch_mm_kwargs, token_budget, replay.buffers
+                    batch_mm_kwargs, token_budget, replay
                 )
                 assert output is not None
                 self.model.postprocess_encoder_output(
