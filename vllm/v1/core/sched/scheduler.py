@@ -116,6 +116,29 @@ class Scheduler(SchedulerInterface):
         # Create KVConnector for the Scheduler. Note that each Worker
         # will have a corresponding KVConnector with Role=WORKER.
         # KV Connector pushes/pull of remote KVs for P/D and offloading.
+        self.throughput_admission = None
+        additional = vllm_config.additional_config
+        additional = additional if isinstance(additional, dict) else {}
+        throughput_config = additional.get("throughput_scheduler", {})
+        if throughput_config.get("enabled", False):
+            parallel = vllm_config.parallel_config
+            if (
+                parallel.tensor_parallel_size != 1
+                or parallel.pipeline_parallel_size != 1
+                or parallel.data_parallel_size != 1
+                or vllm_config.speculative_config
+                or not additional.get("fixed_prefix_cache")
+            ):
+                raise ValueError(
+                    "Throughput scheduler requires single-engine fixed prefix "
+                    "without speculation"
+                )
+            from vllm.v1.core.throughput_scheduler import ThroughputAdmission
+
+            self.throughput_admission = ThroughputAdmission(throughput_config)
+            logger.info(
+                "Throughput scheduler enabled: %s", self.throughput_admission.options
+            )
         self.connector = None
         self.connector_prefix_cache_stats: PrefixCacheStats | None = None
         self.recompute_kv_load_failures = True
@@ -343,6 +366,7 @@ class Scheduler(SchedulerInterface):
 
     def schedule(self) -> SchedulerOutput:
         self.current_step += 1
+        throughput_scanned = 0
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -764,6 +788,29 @@ class Scheduler(SchedulerInterface):
                     # only if it fits in (free - other in-flight reservations), to
                     # avoid deadlock and predictable preemptions.
                     reserved_blocks = self._inflight_prefill_reserved_blocks()
+
+                admission = self.throughput_admission
+                if admission is not None and not admission.allows(
+                    self.kv_cache_manager,
+                    self.running,
+                    request,
+                    new_computed_blocks.blocks,
+                    num_computed_tokens,
+                ):
+                    # No cache allocations have occurred yet. Release only the
+                    # encoder reservation made during this candidate attempt.
+                    if request.has_encoder_inputs:
+                        self.encoder_cache_manager.free(request)
+                    throughput_scanned += 1
+                    if (
+                        scheduled_timestamp - request.arrival_time
+                        >= admission.options["aging_seconds"]
+                        or throughput_scanned >= admission.options["queue_scan_limit"]
+                    ):
+                        break
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
 
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,

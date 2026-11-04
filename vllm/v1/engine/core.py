@@ -675,7 +675,15 @@ class EngineCore:
             manager.fixed_prefix_registry = FixedPrefixRegistry(manager, fraction)
         if operation not in ("prepare", "status", "unregister"):
             raise ValueError("Invalid fixed prefix operation")
-        return getattr(manager.fixed_prefix_registry, operation)(*arguments)
+        result = getattr(manager.fixed_prefix_registry, operation)(*arguments)
+        admission = cast(Any, self.scheduler).throughput_admission
+        if operation == "status" and admission is not None:
+            result["throughput_scheduler"] = {
+                "options": admission.options,
+                "blocked_checks": admission.blocked,
+                "last_growth_blocks": admission.last_growth,
+            }
+        return result
 
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
