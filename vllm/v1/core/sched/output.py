@@ -217,6 +217,8 @@ class SchedulerOutput:
     # Request IDs that are preempted in this step.
     # Only used for v2 model runner.
     preempted_req_ids: set[str] | None = None
+    # (cache group, source block, private destination block), before execution.
+    fixed_prefix_copies: list[tuple[int, int, int]] | None = None
 
     # Whether any of the scheduled requests use structured output.
     # Set only in async scheduling case.

@@ -324,7 +324,11 @@ class Scheduler(SchedulerInterface):
             num_computed_tokens_after_sched = num_computed_tokens + num_new_tokens
             if num_computed_tokens_after_sched < last_cache_position:
                 # align to block_size
-                num_new_tokens = num_new_tokens // block_size * block_size
+                num_new_tokens = max(
+                    0,
+                    num_computed_tokens_after_sched // block_size * block_size
+                    - num_computed_tokens,
+                )
             elif (
                 num_computed_tokens
                 < last_cache_position
@@ -946,6 +950,10 @@ class Scheduler(SchedulerInterface):
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
         )
+
+        registry = self.kv_cache_manager.fixed_prefix_registry
+        if registry is not None:
+            scheduler_output.fixed_prefix_copies = registry.take_copies()
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
