@@ -10,7 +10,7 @@ from typing import Any
 class ThroughputAdmission:
     def __init__(self, config):
         mode = config.get("reservation_mode", "conservative")
-        if mode not in ("conservative", "soft", "boundary"):
+        if mode not in ("conservative", "soft", "boundary", "aggressive"):
             raise ValueError("Unknown reservation_mode")
         defaults = dict(
             growth_reservation_fraction=0.25,
@@ -126,13 +126,14 @@ class ThroughputAdmission:
         started_estimate = time.perf_counter()
         empty = manager.empty_kv_cache_blocks.blocks
         demands = [
-            (r, self.needed(manager, r, empty, r.num_computed_tokens)) for r in running
+            (r, self.needed(manager, r, empty, r.num_computed_tokens))
+            for r in (running if self.mode != "aggressive" else ())
         ]
         growth = sum(f for _, f in demands)
         self.last_growth = growth
         need = self.needed(manager, request, blocks, computed)
         near = far = 0
-        if self.mode == "boundary":
+        if self.mode in ("boundary", "aggressive"):
             for r, f in demands:
                 n = self.needed(
                     manager,

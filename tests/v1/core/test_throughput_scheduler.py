@@ -137,3 +137,29 @@ def test_boundary_targets_and_shared_cap():
 def test_invalid_boundary_settings(config):
     with pytest.raises(ValueError):
         ThroughputAdmission(config)
+
+
+def test_aggressive_ignores_other_requests_future_growth():
+    a = ThroughputAdmission(
+        {"reservation_mode": "aggressive", "near_tokens": 1, "safety_fraction": 0.005}
+    )
+    seen = []
+
+    def estimate(**kw):
+        seen.append(kw["request_id"])
+        return 2
+
+    m = NS(
+        max_model_len=16384,
+        empty_kv_cache_blocks=NS(blocks=((),)),
+        coordinator=NS(get_num_blocks_to_allocate=estimate),
+        block_pool=NS(num_gpu_blocks=100, get_num_free_blocks=lambda: 3),
+        fixed_prefix_registry=None,
+    )
+    other = req()
+    other.request_id = "other"
+    assert a.allows(m, [other], req(), ((),), 2024)
+    assert "other" not in seen
+    assert a.last_growth == 0
+    m.block_pool.get_num_free_blocks = lambda: 2
+    assert not a.allows(m, [other], req(), ((),), 2024)
