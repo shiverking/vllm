@@ -97,3 +97,43 @@ def test_wait_age_uses_arrival_wall_clock(monkeypatch):
     )
     assert ThroughputAdmission.wait_age(NS(arrival_time=1700000000)) == 40
     assert ThroughputAdmission.wait_age(NS(arrival_time=1700000050)) == 0
+
+
+def test_boundary_targets_and_shared_cap():
+    a = ThroughputAdmission({"reservation_mode": "boundary"})
+    assert a.near_target(req(), 16384) == 4078
+    assert a.near_target(req(4090), 16384) == 8158
+    assert a.near_target(req(), 4070) == 4070
+    # Already owned pages are excluded by the coordinator; only future
+    # increments are counted. Near=2, far delta=98: shared cap is 5 blocks.
+    m = NS(
+        max_model_len=16384,
+        empty_kv_cache_blocks=NS(blocks=((),)),
+        coordinator=NS(
+            get_num_blocks_to_allocate=lambda **kw: (
+                2 if kw["num_tokens"] < 4100 else 100
+            )
+        ),
+        block_pool=NS(num_gpu_blocks=100, get_num_free_blocks=lambda: 10),
+        fixed_prefix_registry=None,
+    )
+    assert not a.allows(m, [req()], req(), ((),), 2024)
+    assert a.telemetry["last_near_growth_blocks"] == 2
+    assert a.telemetry["last_far_growth_blocks"] == 98
+    assert a.telemetry["last_discounted_growth_blocks"] == 7
+    m.block_pool.get_num_free_blocks = lambda: 11
+    assert a.allows(m, [req()], req(), ((),), 2024)
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"near_tokens": 0},
+        {"near_tokens": 1.5},
+        {"far_reservation_fraction": 1.1},
+        {"far_pool_cap_fraction": 0},
+    ],
+)
+def test_invalid_boundary_settings(config):
+    with pytest.raises(ValueError):
+        ThroughputAdmission(config)

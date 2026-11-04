@@ -10,10 +10,13 @@ from typing import Any
 class ThroughputAdmission:
     def __init__(self, config):
         mode = config.get("reservation_mode", "conservative")
-        if mode not in ("conservative", "soft"):
+        if mode not in ("conservative", "soft", "boundary"):
             raise ValueError("Unknown reservation_mode")
         defaults = dict(
             growth_reservation_fraction=0.25,
+            near_tokens=16,
+            far_reservation_fraction=0.10,
+            far_pool_cap_fraction=0.05,
             normal_output_tokens=512,
             recovery_output_tokens=1024,
             growth_step_tokens=256,
@@ -43,16 +46,25 @@ class ThroughputAdmission:
                 "safety_fraction",
                 "aging_seconds",
                 "growth_reservation_fraction",
+                "far_reservation_fraction",
+                "far_pool_cap_fraction",
             ) and not isinstance(value, int):
                 raise ValueError(f"Expected integer: {key}")
         if defaults["safety_fraction"] >= 1:
             raise ValueError("safety_fraction must be less than one")
         if defaults["growth_reservation_fraction"] > 1:
             raise ValueError("growth_reservation_fraction must be at most one")
+        for key in ("far_reservation_fraction", "far_pool_cap_fraction"):
+            if defaults[key] > 1:
+                raise ValueError(f"{key} must be at most one")
         self.mode = mode
         self.options: dict[str, Any] = defaults
         self.options["reservation_mode"] = mode
         self.telemetry = dict(
+            estimate_seconds=0.0,
+            candidate_checks=0,
+            last_near_growth_blocks=0,
+            last_far_growth_blocks=0,
             growth_blocked_checks=0,
             capacity_blocked_checks=0,
             blocked_seconds=0.0,
@@ -80,8 +92,16 @@ class ThroughputAdmission:
             max_model_len, request.num_prompt_tokens + min(request.max_tokens, output)
         )
 
-    def needed(self, manager, request, blocks, computed):
-        target = self.target(request, manager.max_model_len)
+    def near_target(self, request, max_model_len):
+        return min(
+            max_model_len,
+            request.num_tokens + self.options["near_tokens"],
+            request.num_prompt_tokens + request.max_tokens,
+        )
+
+    def needed(self, manager, request, blocks, computed, target=None):
+        if target is None:
+            target = self.target(request, manager.max_model_len)
         # Some managers use defaultdict lookups even during estimation.
         absent = [
             m
@@ -103,12 +123,33 @@ class ThroughputAdmission:
                 m.req_to_blocks.pop(request.request_id, None)
 
     def allows(self, manager, running, request, blocks, computed):
+        started_estimate = time.perf_counter()
         empty = manager.empty_kv_cache_blocks.blocks
-        growth = sum(
-            self.needed(manager, r, empty, r.num_computed_tokens) for r in running
-        )
+        demands = [
+            (r, self.needed(manager, r, empty, r.num_computed_tokens)) for r in running
+        ]
+        growth = sum(f for _, f in demands)
         self.last_growth = growth
         need = self.needed(manager, request, blocks, computed)
+        near = far = 0
+        if self.mode == "boundary":
+            for r, f in demands:
+                n = self.needed(
+                    manager,
+                    r,
+                    empty,
+                    r.num_computed_tokens,
+                    self.near_target(r, manager.max_model_len),
+                )
+                near += n
+                far += max(0, f - n)
+            need = self.needed(
+                manager,
+                request,
+                blocks,
+                computed,
+                self.near_target(request, manager.max_model_len),
+            )
         # Fixed-prefix continuation copies its partial attention tail and
         # recurrent checkpoints into private pages. Account conservatively.
         registry = manager.fixed_prefix_registry
@@ -125,9 +166,23 @@ class ThroughputAdmission:
             if self.mode == "soft"
             else growth
         )
+        if self.mode == "boundary":
+            shared_far = min(
+                math.ceil(far * self.options["far_reservation_fraction"]),
+                math.floor(
+                    manager.block_pool.num_gpu_blocks
+                    * self.options["far_pool_cap_fraction"]
+                ),
+            )
+            discounted = near + shared_far
         self.telemetry.update(
-            last_free_blocks=free, last_discounted_growth_blocks=discounted
+            last_free_blocks=free,
+            last_discounted_growth_blocks=discounted,
+            last_near_growth_blocks=near,
+            last_far_growth_blocks=far,
         )
+        self.telemetry["candidate_checks"] += 1
+        self.telemetry["estimate_seconds"] += time.perf_counter() - started_estimate
         allowed = discounted + need + safety <= free
         # An individually oversized request must be able to drain alone.
         if not running:
