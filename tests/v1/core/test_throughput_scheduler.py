@@ -56,3 +56,36 @@ def test_admission_accounts_for_running_growth():
 def test_invalid_config(config):
     with pytest.raises(ValueError):
         ThroughputAdmission(config)
+
+
+def test_soft_reservation_rounding_and_lifecycle():
+    a = ThroughputAdmission({"reservation_mode": "soft"})
+    m = NS(
+        max_model_len=16384,
+        empty_kv_cache_blocks=NS(blocks=((),)),
+        coordinator=NS(get_num_blocks_to_allocate=lambda **kw: 10),
+        block_pool=NS(num_gpu_blocks=100, get_num_free_blocks=lambda: 14),
+        fixed_prefix_registry=None,
+    )
+    assert not a.allows(m, [req()], req(), ((),), 2024)
+    assert a.telemetry["last_discounted_growth_blocks"] == 3
+    m.block_pool.get_num_free_blocks = lambda: 15
+    assert a.allows(m, [req()], req(), ((),), 2024)
+    assert not a.blocked_since
+    m.block_pool.get_num_free_blocks = lambda: 0
+    assert not a.allows(m, [req()], req(), ((),), 2024)
+    a.begin_step({})
+    assert not a.blocked_since
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"reservation_mode": "bad"},
+        {"growth_reservation_fraction": 0},
+        {"growth_reservation_fraction": 1.1},
+    ],
+)
+def test_invalid_soft_settings(config):
+    with pytest.raises(ValueError):
+        ThroughputAdmission(config)

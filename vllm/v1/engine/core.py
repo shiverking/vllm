@@ -682,6 +682,7 @@ class EngineCore:
                 "options": admission.options,
                 "blocked_checks": admission.blocked,
                 "last_growth_blocks": admission.last_growth,
+                **admission.telemetry,
             }
         return result
 

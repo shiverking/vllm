@@ -367,6 +367,8 @@ class Scheduler(SchedulerInterface):
     def schedule(self) -> SchedulerOutput:
         self.current_step += 1
         throughput_scanned = 0
+        if self.throughput_admission is not None:
+            self.throughput_admission.begin_step(self.requests)
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -790,6 +792,11 @@ class Scheduler(SchedulerInterface):
                     reserved_blocks = self._inflight_prefill_reserved_blocks()
 
                 admission = self.throughput_admission
+                if admission is not None:
+                    admission.telemetry["max_head_wait_seconds"] = max(
+                        admission.telemetry["max_head_wait_seconds"],
+                        scheduled_timestamp - request.arrival_time,
+                    )
                 if admission is not None and not admission.allows(
                     self.kv_cache_manager,
                     self.running,
@@ -826,6 +833,10 @@ class Scheduler(SchedulerInterface):
                 )
 
                 if new_blocks is None:
+                    if self.throughput_admission is not None:
+                        self.throughput_admission.telemetry[
+                            "capacity_blocked_checks"
+                        ] += 1
                     # The request cannot be scheduled.
 
                     # NOTE: we need to untouch the request from the encode cache

@@ -19,6 +19,7 @@ class FixedPrefixRegistry:
         self.hits = 0
         self.reused_tokens = 0
         self.copy_operations = 0
+        self.vision_blocked_checks = 0
         self.encoder_budget = 0
         self.encoder_remaining = 0
 
@@ -35,7 +36,10 @@ class FixedPrefixRegistry:
         return min(self.encoder_budget, num_embeds + prefix_tokens)
 
     def can_schedule_encoder(self, request, num_embeds):
-        return self.encoder_cost(request, num_embeds) <= self.encoder_remaining
+        allowed = self.encoder_cost(request, num_embeds) <= self.encoder_remaining
+        if not allowed:
+            self.vision_blocked_checks += 1
+        return allowed
 
     def reserve_encoder(self, request, num_embeds):
         self.encoder_remaining -= self.encoder_cost(request, num_embeds)
@@ -188,6 +192,7 @@ class FixedPrefixRegistry:
             "hits": self.hits,
             "reused_tokens": self.reused_tokens,
             "copy_operations": self.copy_operations,
+            "vision_blocked_checks": self.vision_blocked_checks,
             "active_requests": len(entry["users"]),
             "failure": entry.get("failure"),
             "retained_blocks": [
