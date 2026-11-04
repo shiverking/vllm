@@ -89,3 +89,11 @@ def test_soft_reservation_rounding_and_lifecycle():
 def test_invalid_soft_settings(config):
     with pytest.raises(ValueError):
         ThroughputAdmission(config)
+
+
+def test_wait_age_uses_arrival_wall_clock(monkeypatch):
+    monkeypatch.setattr(
+        "vllm.v1.core.throughput_scheduler.time.time", lambda: 1700000040
+    )
+    assert ThroughputAdmission.wait_age(NS(arrival_time=1700000000)) == 40
+    assert ThroughputAdmission.wait_age(NS(arrival_time=1700000050)) == 0

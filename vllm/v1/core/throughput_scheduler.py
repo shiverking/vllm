@@ -143,6 +143,10 @@ class ThroughputAdmission:
                 self.telemetry["blocked_seconds"] += now - started
         return allowed
 
+    @staticmethod
+    def wait_age(request):
+        return max(0.0, time.time() - request.arrival_time)
+
     def begin_step(self, requests):
         now = time.monotonic()
         for key in list(self.blocked_since):

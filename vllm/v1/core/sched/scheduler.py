@@ -795,7 +795,7 @@ class Scheduler(SchedulerInterface):
                 if admission is not None:
                     admission.telemetry["max_head_wait_seconds"] = max(
                         admission.telemetry["max_head_wait_seconds"],
-                        scheduled_timestamp - request.arrival_time,
+                        admission.wait_age(request),
                     )
                 if admission is not None and not admission.allows(
                     self.kv_cache_manager,
@@ -810,7 +810,7 @@ class Scheduler(SchedulerInterface):
                         self.encoder_cache_manager.free(request)
                     throughput_scanned += 1
                     if (
-                        scheduled_timestamp - request.arrival_time
+                        admission.wait_age(request)
                         >= admission.options["aging_seconds"]
                         or throughput_scanned >= admission.options["queue_scan_limit"]
                     ):
