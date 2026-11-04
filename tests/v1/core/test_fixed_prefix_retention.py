@@ -60,6 +60,23 @@ def test_registry_rejects_missing_and_mismatched_prefix():
         registry.lookup(request)
 
 
+def test_encoder_admission_accounts_for_skipped_prefix():
+    registry = FixedPrefixRegistry(SimpleNamespace(block_pool=BlockPool(100, True, 16)))
+    registry.entries["p"] = {"tokens": [1] * 2024}
+    request = SimpleNamespace(
+        sampling_params=SimpleNamespace(extra_args={"fixed_prefix_id": "p"})
+    )
+    registry.begin_step(8192)
+    for _ in range(2):
+        assert registry.can_schedule_encoder(request, 2048)
+        registry.reserve_encoder(request, 2048)
+    assert not registry.can_schedule_encoder(request, 2048)
+    registry.begin_step(8192)
+    assert registry.can_schedule_encoder(request, 16384)
+    registry.reserve_encoder(request, 16384)
+    assert not registry.can_schedule_encoder(request, 1)
+
+
 def test_partial_hybrid_capture_and_private_continuation():
     pool = BlockPool(201, True, 4)
     attention = SimpleNamespace(

@@ -19,6 +19,27 @@ class FixedPrefixRegistry:
         self.hits = 0
         self.reused_tokens = 0
         self.copy_operations = 0
+        self.encoder_budget = 0
+        self.encoder_remaining = 0
+
+    def begin_step(self, token_budget):
+        self.encoder_budget = token_budget
+        self.encoder_remaining = token_budget
+
+    def encoder_cost(self, request, num_embeds):
+        extra = request.sampling_params.extra_args if request.sampling_params else None
+        prefix_id = (extra or {}).get("fixed_prefix_id")
+        prefix_tokens = len(self.entries[prefix_id]["tokens"]) if prefix_id else 0
+        # Retain logical-input admission pressure after skipping text compute.
+        # A single oversized image can still run alone, as in model profiling.
+        return min(self.encoder_budget, num_embeds + prefix_tokens)
+
+    def can_schedule_encoder(self, request, num_embeds):
+        return self.encoder_cost(request, num_embeds) <= self.encoder_remaining
+
+    def reserve_encoder(self, request, num_embeds):
+        self.encoder_remaining -= self.encoder_cost(request, num_embeds)
+        assert self.encoder_remaining >= 0
 
     def prepare(self, prefix_id, token_ids, cache_salt):
         if prefix_id in self.entries:
