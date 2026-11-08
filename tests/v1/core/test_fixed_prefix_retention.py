@@ -10,6 +10,8 @@ from vllm.v1.core.fixed_prefix import FixedPrefixRegistry
 from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 
+pytestmark = pytest.mark.skip_global_cleanup
+
 
 def test_pinned_idle_block_survives_pressure_and_releases():
     pool = BlockPool(8, True, 16)
