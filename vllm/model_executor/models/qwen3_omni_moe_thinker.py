@@ -500,6 +500,36 @@ class Qwen3OmniMoeAudioEncoder(nn.Module):
 
         # Add channel dimension for conv2d
         padded_feature = padded_feature.unsqueeze(1)
+        padded_embed = self._forward_cnn_frontend(padded_feature)
+
+        # Extract valid hidden states and compute cu_seqlens
+        hidden_states = padded_embed[padded_mask_after_cnn]
+
+        # Compute cumulative sequence lengths for chunked attention
+        cu_chunk_lens = [0]
+        window_aftercnn = padded_mask_after_cnn.shape[-1] * (
+            self.n_window_infer // (self.n_window * 2)
+        )
+        for cnn_len in aftercnn_lens_cpu.tolist():
+            num_full_chunks = cnn_len // window_aftercnn
+            remainder = cnn_len % window_aftercnn
+            cu_chunk_lens.extend([window_aftercnn] * num_full_chunks)
+            if remainder:
+                cu_chunk_lens.append(remainder)
+        sequence_lengths = self._build_sequence_lengths(cu_chunk_lens)
+        cu_seqlens = async_tensor_h2d(
+            cu_chunk_lens, dtype=torch.int32, device=hidden_states.device
+        ).cumsum(-1, dtype=torch.int32)
+
+        max_seqlen = self.compute_attn_mask_seqlen(cu_seqlens)
+        return hidden_states, cu_seqlens, max_seqlen, sequence_lengths
+
+    def _forward_cnn_frontend(self, padded_feature: torch.Tensor) -> torch.Tensor:
+        """Encode independent chunks; packing and valid-token selection stay outside.
+
+        Input is [chunks, 1, mel bins, time]. Keep the original convolution
+        chunk limit even when no backend graph wrapper is installed.
+        """
 
         # Apply convolutional layers (chunk if needed to avoid OOM)
         if padded_feature.size(0) <= self.conv_chunksize:
@@ -529,35 +559,7 @@ class Qwen3OmniMoeAudioEncoder(nn.Module):
             .unsqueeze(0)
             .to(padded_embed.dtype)
         )
-        padded_embed = padded_embed + positional_embedding
-
-        # Extract valid hidden states and compute cu_seqlens
-        hidden_states = padded_embed[padded_mask_after_cnn]
-
-        # Compute cumulative sequence lengths for chunked attention
-        cu_chunk_lens = [0]
-        window_aftercnn = padded_mask_after_cnn.shape[-1] * (
-            self.n_window_infer // (self.n_window * 2)
-        )
-        # Use tolist() for efficient batch conversion from tensor to Python
-        for cnn_len in aftercnn_lens_cpu.tolist():
-            num_full_chunks = cnn_len // window_aftercnn
-            remainder = cnn_len % window_aftercnn
-            cu_chunk_lens.extend([window_aftercnn] * num_full_chunks)
-            if remainder:
-                cu_chunk_lens.append(remainder)
-        sequence_lengths = self._build_sequence_lengths(cu_chunk_lens)
-        cu_seqlens = async_tensor_h2d(
-            cu_chunk_lens, dtype=torch.int32, device=hidden_states.device
-        ).cumsum(-1, dtype=torch.int32)
-
-        max_seqlen = self.compute_attn_mask_seqlen(cu_seqlens)
-        return (
-            hidden_states,
-            cu_seqlens,
-            max_seqlen,
-            sequence_lengths,
-        )
+        return padded_embed + positional_embedding
 
     def _forward_encoder_body(
         self,
