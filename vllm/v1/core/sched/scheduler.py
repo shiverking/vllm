@@ -324,7 +324,11 @@ class Scheduler(SchedulerInterface):
             num_computed_tokens_after_sched = num_computed_tokens + num_new_tokens
             if num_computed_tokens_after_sched < last_cache_position:
                 # align to block_size
-                num_new_tokens = num_new_tokens // block_size * block_size
+                num_new_tokens = max(
+                    0,
+                    num_computed_tokens_after_sched // block_size * block_size
+                    - num_computed_tokens,
+                )
             elif (
                 num_computed_tokens
                 < last_cache_position
@@ -365,6 +369,9 @@ class Scheduler(SchedulerInterface):
         # Encoder-related.
         scheduled_encoder_inputs: dict[str, list[int]] = {}
         encoder_compute_budget = self.max_num_encoder_input_tokens
+        registry = self.kv_cache_manager.fixed_prefix_registry
+        if registry is not None:
+            registry.begin_step(self.max_num_scheduled_tokens)
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
 
@@ -947,6 +954,10 @@ class Scheduler(SchedulerInterface):
             new_block_ids_to_zero=new_block_ids_to_zero,
         )
 
+        registry = self.kv_cache_manager.fixed_prefix_registry
+        if registry is not None:
+            scheduler_output.fixed_prefix_copies = registry.take_copies()
+
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
         # 2. Wrap up all the KV cache load / save ops into an opaque object
@@ -1245,7 +1256,11 @@ class Scheduler(SchedulerInterface):
                     0, start_pos - (num_computed_tokens + shift_computed_tokens)
                 )
                 break
-            if not self.encoder_cache_manager.can_allocate(
+            registry = self.kv_cache_manager.fixed_prefix_registry
+            if (
+                registry is not None
+                and not registry.can_schedule_encoder(request, num_encoder_embeds)
+            ) or not self.encoder_cache_manager.can_allocate(
                 request, i, encoder_compute_budget, num_embeds_to_schedule
             ):
                 # The encoder cache is full or the encoder budget is exhausted.
@@ -1294,6 +1309,10 @@ class Scheduler(SchedulerInterface):
             encoder_compute_budget -= num_encoder_embeds
             mm_hashes_to_schedule.add(item_identifier)
             encoder_inputs_to_schedule.append(i)
+            if registry is not None:
+                # Conservative if later allocation fails: the reservation is
+                # reset next step rather than admitting an oversized vision batch.
+                registry.reserve_encoder(request, num_encoder_embeds)
 
         return (
             encoder_inputs_to_schedule,

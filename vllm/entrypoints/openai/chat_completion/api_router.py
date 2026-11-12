@@ -104,3 +104,18 @@ async def create_batch_chat_completion(
 
 def attach_router(app: FastAPI):
     app.include_router(router)
+    from vllm.entrypoints.openai.chat_completion.fixed_prefix import (
+        prefix_completion,
+        prefix_status,
+        register_prefix,
+        unregister_prefix,
+    )
+
+    app.add_api_route("/v1/fixed-prefixes", register_prefix, methods=["POST"])
+    app.add_api_route("/v1/fixed-prefixes/{prefix_id}", prefix_status, methods=["GET"])
+    app.add_api_route(
+        "/v1/fixed-prefixes/{prefix_id}", unregister_prefix, methods=["DELETE"]
+    )
+    app.add_api_route(
+        "/v1/fixed-prefix/completions", prefix_completion, methods=["POST"]
+    )

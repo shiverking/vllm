@@ -373,6 +373,8 @@ class BlockPool:
         Returns:
             True if the block is evicted, False otherwise.
         """
+        if block.pin_count:
+            return False
         # Clean up metrics tracking first to prevent leaks
         if self.metrics_collector:
             self.metrics_collector.on_block_evicted(block)
@@ -410,11 +412,29 @@ class BlockPool:
         for block in blocks:
             # ref_cnt=0 means this block is in the free list (i.e. eviction
             # candidate), so remove it.
-            if block.ref_cnt == 0 and not block.is_null:
+            if block.ref_cnt == 0 and not block.is_null and not block.pin_count:
                 self.free_block_queue.remove(block)
             block.ref_cnt += 1
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
+
+    def pin_blocks(self, blocks: Sequence[KVCacheBlock]) -> None:
+        """Retain blocks without inventing request references."""
+        for block in blocks:
+            if block.is_null:
+                continue
+            if block.ref_cnt == 0 and block.pin_count == 0:
+                self.free_block_queue.remove(block)
+            block.pin_count += 1
+
+    def unpin_blocks(self, blocks: Sequence[KVCacheBlock]) -> None:
+        for block in blocks:
+            if block.is_null:
+                continue
+            assert block.pin_count > 0
+            block.pin_count -= 1
+            if block.pin_count == 0 and block.ref_cnt == 0:
+                self.free_block_queue.append(block)
 
     def free_blocks(
         self, ordered_blocks: Iterable[KVCacheBlock], prepend: bool = False
@@ -433,7 +453,9 @@ class BlockPool:
         for block in blocks_list:
             block.ref_cnt -= 1
         freed_blocks = [
-            block for block in blocks_list if block.ref_cnt == 0 and not block.is_null
+            block
+            for block in blocks_list
+            if block.ref_cnt == 0 and not block.is_null and not block.pin_count
         ]
         if prepend:
             self.free_block_queue.prepend_n(freed_blocks)

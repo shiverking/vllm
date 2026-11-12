@@ -154,6 +154,7 @@ class KVCacheManager:
         )
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
+        self.fixed_prefix_registry = None
         self.kv_cache_config = kv_cache_config
         self.kv_cache_event_metadata = tuple(
             (
@@ -219,6 +220,17 @@ class KVCacheManager:
         # num_computed_tokens to be block-size aligned. Removing this limitation
         # could slightly improve performance in the future.
         max_cache_hit_length = request.num_tokens - 1
+        if self.fixed_prefix_registry is not None:
+            entry = self.fixed_prefix_registry.lookup(request)
+            if entry is not None:
+                n = len(entry["tokens"])
+                if self.prefix_cache_stats is not None:
+                    self.prefix_cache_stats.record(
+                        num_tokens=request.num_tokens,
+                        num_hits=n,
+                        preempted=request.num_preemptions > 0,
+                    )
+                return self.create_kv_cache_blocks(entry["blocks"]), n
         computed_blocks, num_new_computed_tokens = (
             self.coordinator.find_longest_cache_hit(
                 request.block_hashes, max_cache_hit_length
@@ -393,6 +405,13 @@ class KVCacheManager:
         )
 
         available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
+        fixed_entry = None
+        if self.fixed_prefix_registry is not None and num_new_computed_tokens:
+            fixed_entry = self.fixed_prefix_registry.lookup(request)
+            if fixed_entry is not None:
+                num_blocks_to_allocate += self.fixed_prefix_registry.copy_count(
+                    fixed_entry
+                )
         if num_blocks_to_allocate > available_blocks:
             # Cannot allocate new blocks
             return None
@@ -409,6 +428,9 @@ class KVCacheManager:
                 num_local_computed_tokens=num_local_computed_tokens,
                 num_external_computed_tokens=num_external_computed_tokens,
             )
+
+        if fixed_entry is not None:
+            self.fixed_prefix_registry.privatize(request, fixed_entry)
 
         new_blocks = self.coordinator.allocate_new_blocks(
             request.request_id,
@@ -443,6 +465,9 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
+        if self.fixed_prefix_registry is not None:
+            self.fixed_prefix_registry.capture(request)
+            self.fixed_prefix_registry.release(request.request_id)
         self.coordinator.free(request.request_id)
 
     def remove_skipped_blocks(

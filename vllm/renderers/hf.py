@@ -876,6 +876,28 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
         self._apply_chat_template_async = make_async(
             safe_apply_chat_template, executor=self._executor
         )
+        if isinstance(config.additional_config, dict) and config.additional_config.get(
+            "fixed_prefix_cache"
+        ):
+            # Instance-local and bounded: multimodal pixels remain outside this
+            # cache. parse_chat_messages still runs for every image.
+            original_apply = self._apply_chat_template_async
+            template_cache: dict[str, Any] = {}
+
+            async def cached_template(model_config, tokenizer, conversation, **kwargs):
+                kwargs["tokenize"] = True
+                key = repr((conversation, kwargs))
+                if key not in template_cache:
+                    result = await original_apply(
+                        model_config, tokenizer, conversation, **kwargs
+                    )
+                    if len(template_cache) >= 32:
+                        template_cache.pop(next(iter(template_cache)))
+                    template_cache[key] = result
+                result = template_cache[key]
+                return result.copy() if isinstance(result, list) else result
+
+            self._apply_chat_template_async = cached_template
 
         if self.tokenizer is not None:
             maybe_make_thread_pool(

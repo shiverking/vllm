@@ -643,6 +643,41 @@ class EngineCore:
 
         self.model_executor.reset_mm_cache()
 
+    def fixed_prefix(self, operation: str, arguments: list):
+        """Fixed-prefix registry utility for a single Ascend engine."""
+        additional = self.vllm_config.additional_config
+        config = (
+            additional.get("fixed_prefix_cache")
+            if isinstance(additional, dict)
+            else None
+        )
+        if not config:
+            raise ValueError("Fixed prefix cache is disabled")
+        parallel = self.vllm_config.parallel_config
+        if (
+            parallel.tensor_parallel_size != 1
+            or parallel.pipeline_parallel_size != 1
+            or parallel.data_parallel_size != 1
+            or self.vllm_config.speculative_config is not None
+        ):
+            raise ValueError(
+                "Fixed prefix cache requires TP=PP=DP=1 without speculation"
+            )
+        manager = cast(Any, self.scheduler).kv_cache_manager
+        if not manager.enable_caching:
+            raise ValueError("Fixed prefix registration requires prefix caching")
+        if manager.fixed_prefix_registry is None:
+            from vllm.v1.core.fixed_prefix import FixedPrefixRegistry
+
+            fraction = float(config.get("budget_fraction", 0.02))
+            if not 0 < fraction <= 0.1:
+                raise ValueError("Prefix budget fraction must be in (0, 0.1]")
+            manager.fixed_prefix_registry = FixedPrefixRegistry(manager, fraction)
+        if operation not in ("prepare", "status", "unregister"):
+            raise ValueError("Invalid fixed prefix operation")
+        result = getattr(manager.fixed_prefix_registry, operation)(*arguments)
+        return result
+
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:

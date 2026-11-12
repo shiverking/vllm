@@ -7,7 +7,7 @@ import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, cast
 
 import numpy as np
 import pybase64 as base64
@@ -252,6 +252,26 @@ class OpenAIServingChat(OpenAIServing):
             return result
 
         conversation, engine_inputs = result
+
+        fixed_id = (request.vllm_xargs or {}).get("fixed_prefix_id")
+        if fixed_id:
+            entry = getattr(self, "_fixed_prefix_templates", {}).get(fixed_id)
+            if entry is None:
+                return self.create_error_response("Unknown fixed prefix")
+            prefix = cast(dict[str, Any], entry)["tokens"]
+            if (
+                any(
+                    (self._extract_prompt_components(inp).token_ids or [])[
+                        : len(prefix)
+                    ]
+                    != prefix
+                    for inp in engine_inputs
+                )
+                or request.cache_salt != cast(dict[str, Any], entry)["salt"]
+            ):
+                return self.create_error_response("Fixed prefix input mismatch")
+        if (request.vllm_xargs or {}).get("fixed_prefix_capture"):
+            return self.create_error_response("Prefix capture is registration-only")
 
         request_id = (
             f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
